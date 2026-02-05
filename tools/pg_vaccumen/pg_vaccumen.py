@@ -825,10 +825,12 @@ Exit codes:
         password=password,
         sslmode="prefer",
     ) as conn:
-        # Set statement timeout if specified (converts seconds to milliseconds)
+        # Set statement timeout (converts seconds to milliseconds).
+        # Always set explicitly to override any role/database defaults,
+        # since VACUUM on large tables can legitimately run for hours.
+        with conn.cursor() as cur:
+            cur.execute(f"set statement_timeout = {args.statement_timeout * 1000}")
         if args.statement_timeout > 0:
-            with conn.cursor() as cur:
-                cur.execute(f"set statement_timeout = {args.statement_timeout * 1000}")
             print(f"Statement timeout: {args.statement_timeout}s")
 
         # Run preflight checks (always needed to get autovacuum_freeze_max_age)
