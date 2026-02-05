@@ -567,14 +567,21 @@ def get_table_size(conn: psycopg.Connection, table: str) -> int:
         return cur.fetchone()[0] or 0
 
 
-def vacuum_table(conn: psycopg.Connection, table: str) -> float:
+def vacuum_table(conn: psycopg.Connection, table: str, statement_timeout: int = 0) -> float:
     """Run VACUUM ANALYZE VERBOSE on a single table.
+
+    Args:
+        conn: Database connection.
+        table: Table name to vacuum.
+        statement_timeout: Timeout in seconds (0 = no timeout).
 
     Returns:
         Duration in seconds.
     """
     conn.rollback()  # End any implicit transaction before setting autocommit
     conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(f"set statement_timeout = {statement_timeout * 1000}")
     start = time.perf_counter()
     with conn.cursor() as cur:
         cur.execute(f"vacuum (verbose, analyze) {table}")
@@ -1013,7 +1020,7 @@ Exit codes:
             print("-" * 80)
 
             try:
-                duration = vacuum_table(conn, table)
+                duration = vacuum_table(conn, table, args.statement_timeout)
                 total_duration += duration
                 print(f"           Completed in {duration:.1f}s")
 
