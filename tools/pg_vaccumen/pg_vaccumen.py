@@ -115,9 +115,11 @@ class Baseline:
 
     def hours_since(self) -> float:
         """Hours elapsed since baseline was recorded."""
-        baseline_dt = datetime.fromisoformat(self.timestamp)
+        import re
+        # Python < 3.11 needs +00:00 not +00; normalize short tz offsets
+        ts = re.sub(r'([+-]\d{2})$', r'\1:00', self.timestamp)
+        baseline_dt = datetime.fromisoformat(ts)
         now = datetime.now(timezone.utc)
-        # Handle both timezone-aware and naive datetimes
         if baseline_dt.tzinfo is None:
             baseline_dt = baseline_dt.replace(tzinfo=timezone.utc)
         return (now - baseline_dt).total_seconds() / 3600
