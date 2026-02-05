@@ -82,6 +82,11 @@ pipeline {
             description: 'Skip tables larger than this size in GB (leave empty for no limit)'
         )
         booleanParam(
+            name: 'NO_SKIP_AUTOVACUUM',
+            defaultValue: false,
+            description: 'Don\'t skip tables currently being vacuumed by autovacuum (default: skip them)'
+        )
+        booleanParam(
             name: 'EXECUTE',
             defaultValue: false,
             description: 'Execute vacuum (false = dry-run mode)'
@@ -90,6 +95,11 @@ pipeline {
             name: 'FORCE',
             defaultValue: false,
             description: 'Proceed even if blockers are detected (long txns, replication slots, prepared txns)'
+        )
+        booleanParam(
+            name: 'SKIP_PREFLIGHT',
+            defaultValue: false,
+            description: 'Skip preflight checks (not recommended)'
         )
         booleanParam(
             name: 'METRICS_TO_DB',
@@ -191,8 +201,10 @@ pipeline {
                     }
 
                     // Build optional flags
+                    def noSkipAutovacuumFlag = params.NO_SKIP_AUTOVACUUM ? '--no-skip-autovacuum' : ''
                     def executeFlag = params.EXECUTE ? '--execute' : ''
                     def forceFlag = params.FORCE ? '--force' : ''
+                    def skipPreflightFlag = params.SKIP_PREFLIGHT ? '--skip-preflight' : ''
                     def thresholdFlag = params.THRESHOLD?.trim() ? "--threshold '${params.THRESHOLD}'" : ''
                     def timeoutFlag = params.STATEMENT_TIMEOUT?.trim() && params.STATEMENT_TIMEOUT != '0' ? "--statement-timeout '${params.STATEMENT_TIMEOUT}'" : ''
                     def maxSizeFlag = params.MAX_SIZE?.trim() ? "--max-size '${params.MAX_SIZE}'" : ''
@@ -215,6 +227,8 @@ pipeline {
                                 ${maxSizeFlag} \\
                                 ${credFlags} \\
                                 ${forceFlag} \\
+                                ${skipPreflightFlag} \\
+                                ${noSkipAutovacuumFlag} \\
                                 ${executeFlag} \\
                                 ${metricsFlag} \\
                                 ${baselineFlag} \\
