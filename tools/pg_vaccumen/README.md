@@ -13,7 +13,242 @@ Run this script nightly to vacuum tables before they reach the threshold:
 - **Proactive**: Vacuums at 50% of threshold (configurable), not waiting for emergency
 - **Adaptive**: Reads `autovacuum_freeze_max_age` from DB, adjusts when parameter changes
 - **Blocker-aware**: Detects long transactions, replication slots, and prepared transactions that prevent vacuum progress
+- **Autovacuum-aware**: Skips tables already being vacuumed by autovacuum, filters by size
 - **Jenkins-ready**: Exit codes for CI/CD integration
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+Requirements:
+- Python 3.10+
+- boto3 (AWS SDK)
+- psycopg (PostgreSQL adapter, v3)
+
+## Quick Start
+
+```bash
+# Dry-run (default) - shows what would be vacuumed
+python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
+    --database mydb --db-username postgres --db-password secret
+
+# Execute vacuum
+python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
+    --database mydb --db-username postgres --db-password secret --execute
+
+# Using AWS cluster lookup (requires IAM permissions)
+python pg_vaccumen.py --cluster my-aurora-cluster --database mydb
+
+# Skip tables over 500 GB, vacuum up to 30 tables
+python pg_vaccumen.py --host ... --database mydb --execute \
+    --max-size 500 --limit 30 --metrics-to-db --baseline-to-db
+```
+
+## Sample Output
+
+```
+Autovacuum freeze max age: 200,000,000
+Table selection threshold: 100,000,000 (50% of max)
+Max tables per run: 30
+Max table size: 500.0 GB
+Skip autovacuum targets: yes
+
+Alert Status: OK: Oldest XID age at 79% of autovacuum threshold
+
+Tables to vacuum (30 of 139 total exceeding threshold):
+  (5 table(s) excluded by --max-size 500.0 GB)
+----------------------------------------------------------------------------------------------------
+Table                                                Age   % of Max         Size               Note
+----------------------------------------------------------------------------------------------------
+status_key_values                             58,738,271        29%     118.9 GB
+event_transaction_assignments                 57,922,905        28%      64.0 MB
+state_cache                                   57,824,644        28%       1.0 GB [autovacuum running]
+...
+----------------------------------------------------------------------------------------------------
+  ... and 109 more table(s) waiting
+
+RECOMMENDATIONS
+  * Backlog: 109 additional table(s) waiting beyond --limit of 30. Consider --limit 90.
+```
+
+## Real-World Scenario: Catching Up on a 245-Table Backlog
+
+This walkthrough shows how to triage a production database where proactive vacuum has never run and most tables are well past the 50% threshold.
+
+### Initial assessment
+
+A production Aurora PostgreSQL database with `autovacuum_freeze_max_age` at 200M. First dry-run at default 50% threshold:
+
+```
+Alert Status: OK: Oldest XID age at 79% of autovacuum threshold (158,859,691 / 200,000,000)
+
+Tables to vacuum (2):
+  (2 table(s) excluded by --max-size 500.0 GB)
+----------------------------------------------------------------------------------------------------
+Table                                                Age   % of Max         Size               Note
+----------------------------------------------------------------------------------------------------
+event_log                                    158,859,694        79%    2680.1 GB [autovacuum running]
+message_archive                              158,839,100        79%   16183.8 GB [autovacuum running]
+----------------------------------------------------------------------------------------------------
+```
+
+Only 2 tables above 50%, both are massive (2.7 TB and 16 TB), and autovacuum is already running on both. With `--max-size 500` and auto-skip, both are filtered out — nothing to do at this threshold.
+
+### Step 1: Lower the threshold to find the backlog
+
+Drop to 25% (50M) to see what's waiting below the default threshold:
+
+```bash
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 500 --force --limit 30 --threshold 50000000
+```
+
+```
+Tables to vacuum (30 of 139 total exceeding threshold):
+  (5 table(s) excluded by --max-size 500.0 GB)
+----------------------------------------------------------------------------------------------------
+Table                                                Age   % of Max         Size               Note
+----------------------------------------------------------------------------------------------------
+status_key_values                             58,738,271        29%     118.9 GB
+elogs.event_transaction_assignments           57,922,905        28%      64.0 MB
+state_cache                                   57,824,644        28%       1.0 GB
+enclosing_geofences                           56,873,134        28%       1.6 GB
+sensor_statuses                               54,099,678        27%       5.0 MB
+elogs.driver_status                           51,896,819        25%      52.4 MB
+elogs.events                                  50,986,818        25%      55.4 GB
+elogs.raw_events                              50,986,272        25%      50.0 GB
+driver_change_history                         50,985,726        25%      48.5 GB
+command_audit                                 50,985,230        25%     307.0 GB
+hourly_incident_counts                        50,985,000        25%     498.0 GB
+...
+----------------------------------------------------------------------------------------------------
+  ... and 109 more table(s) waiting
+
+RECOMMENDATIONS
+  * Backlog: 109 additional table(s) waiting beyond --limit of 30. Total needing vacuum: 139.
+    Consider --limit 90.
+```
+
+139 tables between 25-29% of the 200M threshold. Sizes range from 5 MB to 498 GB.
+
+### Step 2: Vacuum the small tables first
+
+Start with smaller tables to make quick progress on the backlog:
+
+```bash
+# Vacuum tables under 100 GB, up to 50 per run
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 100 --force --limit 50 --threshold 50000000 --execute \
+    --metrics-to-db --baseline-to-db
+```
+
+This knocks out dozens of small tables quickly while skipping the 100+ GB tables that would take hours each.
+
+### Step 3: Increase size limit for bigger tables
+
+Once the small tables are done, raise the size limit:
+
+```bash
+# Now vacuum tables up to 500 GB
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 500 --force --limit 10 --threshold 50000000 --execute \
+    --metrics-to-db --baseline-to-db
+```
+
+Fewer tables per run (`--limit 10`) since each one is larger and takes longer.
+
+### Step 4: Return to normal nightly schedule
+
+Once the backlog is cleared, return to the default 50% threshold for nightly runs:
+
+```bash
+# Nightly cron / Jenkins job
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 500 --limit 30 --execute \
+    --metrics-to-db --baseline-to-db
+```
+
+### Key takeaways
+
+| Lesson | Detail |
+|--------|--------|
+| Start with dry-run | Always verify what will be vacuumed before adding `--execute` |
+| Lower threshold to find backlog | Default 50% may miss tables that need proactive attention |
+| Use `--max-size` to prioritize | Vacuum many small tables quickly before tackling large ones |
+| Auto-skip prevents wasted I/O | Don't re-vacuum what autovacuum is already handling |
+| Increase `--limit` for backlogs | The recommendation engine tells you when to increase it |
+| Work in phases | Small tables first, then medium, then large — each in separate runs if needed |
+
+## Command-Line Options
+
+### Connection Options
+
+| Option | Description |
+|--------|-------------|
+| `--cluster` | Aurora cluster identifier (uses boto3 to lookup endpoint) |
+| `--host` | Database host (bypasses AWS lookup) |
+| `--database` | Database name (required) |
+| `--region` | AWS region (default: us-west-2) |
+| `--db-username` | Database username (default: postgres) |
+| `--db-password` | Database password (required with --host, otherwise uses Secrets Manager) |
+
+### Threshold Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--threshold` | 50% of max | Select tables with relfrozenxid age above this value |
+| `--warning-pct` | 80 | Alert warning when oldest table exceeds this % of max |
+| `--critical-pct` | 95 | Alert critical when oldest table exceeds this % of max |
+| `--limit` | 10 | Maximum tables to vacuum per run |
+| `--max-size` | No limit | Skip tables larger than this size in GB |
+| `--no-skip-autovacuum` | Skip enabled | Don't skip tables currently being vacuumed by autovacuum |
+
+### Execution Options
+
+| Option | Description |
+|--------|-------------|
+| `--execute` | Actually run vacuum (default is dry-run) |
+| `--force` | Proceed despite blockers (long txns, replication slots) |
+| `--skip-preflight` | Skip preflight checks (not recommended) |
+| `--statement-timeout` | Timeout in seconds for vacuum operations (default: 0 = no timeout) |
+
+### Transaction Rate Tracking
+
+| Option | Description |
+|--------|-------------|
+| `--baseline-to-db` | Store/load baseline from `vacuum_baseline` table (recommended) |
+| `--baseline-file` | JSON file to store/load transaction baseline (local/testing) |
+| `--save-baseline` | Save current stats as new baseline (use with either option above) |
+
+### Metrics and Instrumentation
+
+| Option | Description |
+|--------|-------------|
+| `--metrics-file` | JSON file to append vacuum metrics (duration, size, etc.) |
+| `--metrics-to-db` | Store metrics in `vacuum_metrics` table (recommended for Jenkins) |
+
+## Exit Codes
+
+| Code | Meaning | Jenkins Result |
+|------|---------|----------------|
+| 0 | OK - maintenance keeping up | SUCCESS |
+| 1 | Error - connection failure or blockers | FAILURE |
+| 2 | Warning - tables approaching threshold | UNSTABLE |
+| 3 | Critical - tables at/past threshold | FAILURE |
+
+## Tuning Guidance
+
+| Symptom | Action |
+|---------|--------|
+| "Days until autovacuum" shrinking | Increase `--limit` or run more frequently |
+| Hitting `--limit` with large backlog | Increase `--limit` (try 2-3x) |
+| >30 days headroom, no tables to vacuum | Reduce frequency or raise `--threshold` |
+| Blockers detected | Investigate long-running transactions or lagging replication slots |
+| A few huge tables dominate the queue | Use `--max-size` to skip them, let autovacuum handle |
+| Many tables skipped (autovacuum running) | Autovacuum is keeping up — focus `--limit` on remaining tables |
+| Tables excluded by size need vacuuming | Run a separate job without `--max-size` during a longer window |
 
 ## Locking Behavior
 
@@ -109,27 +344,6 @@ Two features solve this:
 | Autovacuum already handling the biggest tables | Let auto-skip handle it (default) |
 | Both huge tables and active autovacuum | Use both — `--max-size 500` filters the monsters, auto-skip handles the rest |
 | You want to vacuum everything, including monsters | `--no-skip-autovacuum` and omit `--max-size` |
-
-**Example:**
-
-```bash
-# Skip tables over 500 GB, let autovacuum handle the rest
-python pg_vaccumen.py --host ... --database mydb --execute --max-size 500 --limit 50
-```
-
-The dry-run output shows table sizes and marks tables where autovacuum is active:
-
-```
-Tables to vacuum (50 of 243 total exceeding threshold):
-  (2 table(s) excluded by --max-size 500.0 GB)
-----------------------------------------------------------------------------------------------------
-Table                                              Age     % of Max         Size               Note
-----------------------------------------------------------------------------------------------------
-asset_locations                             140,221,003         70%    85.3 GB [autovacuum running]
-work_orders                                 138,500,122         69%    42.1 GB
-inventory_items                             135,002,881         67%    28.7 GB
-...
-```
 
 ## Blockers: What Prevents Vacuum Progress
 
@@ -291,88 +505,74 @@ Day 4: Tables at ~386M, nightly vacuum runs, resets highest tables
 
 The maintenance becomes routine and boring—exactly what you want.
 
-## Installation
+## Jenkins Integration
 
-```bash
-pip install -r requirements.txt
+The included `Jenkinsfile` provides a parameterized pipeline for nightly runs.
+
+### Pipeline Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `CLUSTER` | | Aurora cluster identifier (or use HOST) |
+| `HOST` | | Database host directly (or use CLUSTER) |
+| `DATABASE` | my_db | Database name |
+| `REGION` | us-east-1 | AWS region |
+| `DB_USERNAME` | postgres | Database username |
+| `DB_PASSWORD` | | Database password |
+| `THRESHOLD` | | Table selection threshold (empty = 50% of max) |
+| `WARNING_PCT` | 80 | Warning alert percentage |
+| `CRITICAL_PCT` | 95 | Critical alert percentage |
+| `LIMIT` | 10 | Max tables per run |
+| `STATEMENT_TIMEOUT` | 0 | Timeout in seconds for vacuum (0 = no timeout) |
+| `MAX_SIZE` | | Skip tables larger than this size in GB (empty = no limit) |
+| `NO_SKIP_AUTOVACUUM` | false | Don't skip tables being vacuumed by autovacuum |
+| `EXECUTE` | false | Actually vacuum (false = dry-run) |
+| `FORCE` | false | Proceed despite blockers |
+| `SKIP_PREFLIGHT` | false | Skip preflight checks |
+| `METRICS_TO_DB` | true | Store metrics in database |
+| `BASELINE_TO_DB` | true | Store baseline in database |
+| `SAVE_BASELINE` | false | Save new baseline this run |
+
+### First Run Setup
+
+On the first Jenkins run, establish the baseline:
+
+```
+EXECUTE=false        # Dry-run to verify everything works
+SAVE_BASELINE=true   # Establish transaction rate baseline
+METRICS_TO_DB=true   # Enable metrics collection
+BASELINE_TO_DB=true  # Enable baseline tracking
 ```
 
-Requirements:
-- Python 3.10+
-- boto3 (AWS SDK)
-- psycopg (PostgreSQL adapter, v3)
+This creates the tracking tables:
+- `vacuum_baseline` - transaction rate baseline
+- `vacuum_metrics` - vacuum performance history
 
-## Quick Start
+### Subsequent Runs (Nightly)
 
-```bash
-# Dry-run (default) - shows what would be vacuumed
-python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
-    --database mydb --db-username postgres --db-password secret
-
-# Execute vacuum
-python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
-    --database mydb --db-username postgres --db-password secret --execute
-
-# Using AWS cluster lookup (requires IAM permissions)
-python pg_vaccumen.py --cluster my-aurora-cluster --database mydb
+```
+EXECUTE=true         # Actually vacuum
+SAVE_BASELINE=false  # Use existing baseline
+METRICS_TO_DB=true   # Continue collecting metrics
+BASELINE_TO_DB=true  # Use baseline for rate calculation
+LIMIT=30             # Adjust based on backlog
+MAX_SIZE=500         # Skip tables over 500 GB
 ```
 
-## Command-Line Options
+### Re-establishing Baseline
 
-### Connection Options
+After a major version upgrade or stats reset, re-establish the baseline:
 
-| Option | Description |
-|--------|-------------|
-| `--cluster` | Aurora cluster identifier (uses boto3 to lookup endpoint) |
-| `--host` | Database host (bypasses AWS lookup) |
-| `--database` | Database name (required) |
-| `--region` | AWS region (default: us-west-2) |
-| `--db-username` | Database username (default: postgres) |
-| `--db-password` | Database password (required with --host, otherwise uses Secrets Manager) |
+```
+SAVE_BASELINE=true   # Reset the baseline
+```
 
-### Threshold Options
+### Key Features
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--threshold` | 50% of max | Select tables with relfrozenxid age above this value |
-| `--warning-pct` | 80 | Alert warning when oldest table exceeds this % of max |
-| `--critical-pct` | 95 | Alert critical when oldest table exceeds this % of max |
-| `--limit` | 10 | Maximum tables to vacuum per run |
-| `--max-size` | No limit | Skip tables larger than this size in GB |
-| `--no-skip-autovacuum` | Skip enabled | Don't skip tables currently being vacuumed by autovacuum |
-
-### Execution Options
-
-| Option | Description |
-|--------|-------------|
-| `--execute` | Actually run vacuum (default is dry-run) |
-| `--force` | Proceed despite blockers (long txns, replication slots) |
-| `--skip-preflight` | Skip preflight checks (not recommended) |
-| `--statement-timeout` | Timeout in seconds for vacuum operations (default: 0 = no timeout) |
-
-### Transaction Rate Tracking
-
-| Option | Description |
-|--------|-------------|
-| `--baseline-to-db` | Store/load baseline from `vacuum_baseline` table (recommended) |
-| `--baseline-file` | JSON file to store/load transaction baseline (local/testing) |
-| `--save-baseline` | Save current stats as new baseline (use with either option above) |
-
-### Metrics and Instrumentation
-
-| Option | Description |
-|--------|-------------|
-| `--metrics-file` | JSON file to append vacuum metrics (duration, size, etc.) |
-| `--metrics-to-db` | Store metrics in `vacuum_metrics` table (recommended for Jenkins) |
-
-## Exit Codes
-
-| Code | Meaning | Jenkins Result |
-|------|---------|----------------|
-| 0 | OK - maintenance keeping up | SUCCESS |
-| 1 | Error - connection failure or blockers | FAILURE |
-| 2 | Warning - tables approaching threshold | UNSTABLE |
-| 3 | Critical - tables at/past threshold | FAILURE |
+- Dry-run by default (set EXECUTE=true to vacuum)
+- Password handling via workspace file with cleanup
+- Exit code mapping to Jenkins build status
+- All data persists in database (no external storage needed)
 
 ## Transaction Rate Tracking
 
@@ -432,21 +632,6 @@ Use `--metrics-to-db` to store metrics in the database itself. The table is crea
 
 ```bash
 python pg_vaccumen.py --host ... --execute --metrics-to-db
-```
-
-This creates `vacuum_metrics`:
-
-```sql
-create table vacuum_metrics (
-    id serial primary key,
-    vacuumed_at timestamptz default now(),
-    table_name text not null,
-    age_before bigint,
-    size_bytes bigint,
-    duration_seconds numeric(10,2),
-    database_name text,
-    cluster_host text
-);
 ```
 
 **Query examples:**
@@ -562,218 +747,6 @@ Each vacuum appends a JSON record with the same fields.
 | Duration vs size correlation | Validate I/O performance |
 | Duration trends over time | Detect degradation |
 | Tables vacuumed most frequently | Hottest tables for per-table tuning |
-
-## Sample Output
-
-```
-Autovacuum freeze max age: 200,000,000
-Table selection threshold: 100,000,000 (50% of max)
-
-Transaction Rate:
-  Stats reset at:                (never)
-  Total transactions recorded:   26,470,074,728
-  Transactions per day:          112,221,507 (from baseline, 1.0 days)
-  Est. time to autovacuum:       11.3 hours  *** URGENT ***
-
-Alert Status: OK: Oldest XID age at 73% of autovacuum threshold
-
-Tables to vacuum (10 of 244 total exceeding threshold):
---------------------------------------------------------------------------------
-Table                                                     Age     % of Max
---------------------------------------------------------------------------------
-assets                                            146,935,397          73%
-asset_used_audit                       146,934,924          73%
-...
-
-RECOMMENDATIONS
-  • URGENT: Only 11.3 hours until autovacuum triggers. Increase --limit significantly (try 40) or run more frequently.
-  • Backlog: 234 additional table(s) waiting beyond --limit of 10. Total needing vacuum: 244. Consider --limit 30.
-```
-
-## Real-World Scenario: Catching Up on a 245-Table Backlog
-
-This walkthrough shows how to triage a production database where proactive vacuum has never run and most tables are well past the 50% threshold.
-
-### Initial assessment
-
-A production Aurora PostgreSQL database with `autovacuum_freeze_max_age` at 200M. First dry-run at default 50% threshold:
-
-```
-Alert Status: OK: Oldest XID age at 79% of autovacuum threshold (158,859,691 / 200,000,000)
-
-Tables to vacuum (2):
-  (2 table(s) excluded by --max-size 500.0 GB)
-----------------------------------------------------------------------------------------------------
-Table                                                Age   % of Max         Size               Note
-----------------------------------------------------------------------------------------------------
-event_log                                    158,859,694        79%    2680.1 GB [autovacuum running]
-message_archive                              158,839,100        79%   16183.8 GB [autovacuum running]
-----------------------------------------------------------------------------------------------------
-```
-
-Only 2 tables above 50%, both are massive (2.7 TB and 16 TB), and autovacuum is already running on both. With `--max-size 500` and auto-skip, both are filtered out — nothing to do at this threshold.
-
-### Step 1: Lower the threshold to find the backlog
-
-Drop to 25% (50M) to see what's waiting below the default threshold:
-
-```bash
-python pg_vaccumen.py --host ... --database mydb \
-    --max-size 500 --force --limit 30 --threshold 50000000
-```
-
-```
-Tables to vacuum (30 of 139 total exceeding threshold):
-  (5 table(s) excluded by --max-size 500.0 GB)
-----------------------------------------------------------------------------------------------------
-Table                                                Age   % of Max         Size               Note
-----------------------------------------------------------------------------------------------------
-status_key_values                             58,738,271        29%     118.9 GB
-elogs.event_transaction_assignments           57,922,905        28%      64.0 MB
-state_cache                                   57,824,644        28%       1.0 GB
-enclosing_geofences                           56,873,134        28%       1.6 GB
-sensor_statuses                               54,099,678        27%       5.0 MB
-elogs.driver_status                           51,896,819        25%      52.4 MB
-elogs.events                                  50,986,818        25%      55.4 GB
-elogs.raw_events                              50,986,272        25%      50.0 GB
-driver_change_history                         50,985,726        25%      48.5 GB
-command_audit                                 50,985,230        25%     307.0 GB
-hourly_incident_counts                        50,985,000        25%     498.0 GB
-...
-----------------------------------------------------------------------------------------------------
-  ... and 109 more table(s) waiting
-
-RECOMMENDATIONS
-  • Backlog: 109 additional table(s) waiting beyond --limit of 30. Total needing vacuum: 139.
-    Consider --limit 90.
-```
-
-139 tables between 25-29% of the 200M threshold. Sizes range from 5 MB to 498 GB.
-
-### Step 2: Vacuum the small tables first
-
-Start with smaller tables to make quick progress on the backlog:
-
-```bash
-# Vacuum tables under 100 GB, up to 50 per run
-python pg_vaccumen.py --host ... --database mydb \
-    --max-size 100 --force --limit 50 --threshold 50000000 --execute \
-    --metrics-to-db --baseline-to-db
-```
-
-This knocks out dozens of small tables quickly while skipping the 100+ GB tables that would take hours each.
-
-### Step 3: Increase size limit for bigger tables
-
-Once the small tables are done, raise the size limit:
-
-```bash
-# Now vacuum tables up to 500 GB
-python pg_vaccumen.py --host ... --database mydb \
-    --max-size 500 --force --limit 10 --threshold 50000000 --execute \
-    --metrics-to-db --baseline-to-db
-```
-
-Fewer tables per run (`--limit 10`) since each one is larger and takes longer.
-
-### Step 4: Return to normal nightly schedule
-
-Once the backlog is cleared, return to the default 50% threshold for nightly runs:
-
-```bash
-# Nightly cron / Jenkins job
-python pg_vaccumen.py --host ... --database mydb \
-    --max-size 500 --limit 30 --execute \
-    --metrics-to-db --baseline-to-db
-```
-
-### Key takeaways
-
-| Lesson | Detail |
-|--------|--------|
-| Start with dry-run | Always verify what will be vacuumed before adding `--execute` |
-| Lower threshold to find backlog | Default 50% may miss tables that need proactive attention |
-| Use `--max-size` to prioritize | Vacuum many small tables quickly before tackling large ones |
-| Auto-skip prevents wasted I/O | Don't re-vacuum what autovacuum is already handling |
-| Increase `--limit` for backlogs | The recommendation engine tells you when to increase it |
-| Work in phases | Small tables first, then medium, then large — each in separate runs if needed |
-
-## Tuning Guidance
-
-| Symptom | Action |
-|---------|--------|
-| "Days until autovacuum" shrinking | Increase `--limit` or run more frequently |
-| Hitting `--limit` with large backlog | Increase `--limit` (try 2-3x) |
-| >30 days headroom, no tables to vacuum | Reduce frequency or raise `--threshold` |
-| Blockers detected | Investigate long-running transactions or lagging replication slots |
-| A few huge tables dominate the queue | Use `--max-size` to skip them, let autovacuum handle |
-| Many tables skipped (autovacuum running) | Autovacuum is keeping up — focus `--limit` on remaining tables |
-| Tables excluded by size need vacuuming | Run a separate job without `--max-size` during a longer window |
-
-## Jenkins Integration
-
-The included `Jenkinsfile` provides a parameterized pipeline for nightly runs.
-
-### Pipeline Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `CLUSTER` | | Aurora cluster identifier (or use HOST) |
-| `HOST` | | Database host directly (or use CLUSTER) |
-| `DATABASE` | my_db | Database name |
-| `REGION` | us-east-1 | AWS region |
-| `DB_USERNAME` | postgres | Database username |
-| `DB_PASSWORD` | | Database password |
-| `THRESHOLD` | | Table selection threshold (empty = 50% of max) |
-| `WARNING_PCT` | 80 | Warning alert percentage |
-| `CRITICAL_PCT` | 95 | Critical alert percentage |
-| `LIMIT` | 10 | Max tables per run |
-| `MAX_SIZE` | | Skip tables larger than this size in GB (empty = no limit) |
-| `EXECUTE` | false | Actually vacuum (false = dry-run) |
-| `FORCE` | false | Proceed despite blockers |
-| `METRICS_TO_DB` | true | Store metrics in database |
-| `BASELINE_TO_DB` | true | Store baseline in database |
-| `SAVE_BASELINE` | false | Save new baseline this run |
-
-### First Run Setup
-
-On the first Jenkins run, establish the baseline:
-
-```
-EXECUTE=false        # Dry-run to verify everything works
-SAVE_BASELINE=true   # Establish transaction rate baseline
-METRICS_TO_DB=true   # Enable metrics collection
-BASELINE_TO_DB=true  # Enable baseline tracking
-```
-
-This creates the tracking tables:
-- `vacuum_baseline` - transaction rate baseline
-- `vacuum_metrics` - vacuum performance history
-
-### Subsequent Runs (Nightly)
-
-```
-EXECUTE=true         # Actually vacuum
-SAVE_BASELINE=false  # Use existing baseline
-METRICS_TO_DB=true   # Continue collecting metrics
-BASELINE_TO_DB=true  # Use baseline for rate calculation
-LIMIT=30             # Adjust based on backlog
-```
-
-### Re-establishing Baseline
-
-After a major version upgrade or stats reset, re-establish the baseline:
-
-```
-SAVE_BASELINE=true   # Reset the baseline
-```
-
-### Key Features
-
-- Dry-run by default (set EXECUTE=true to vacuum)
-- Password handling via workspace file with cleanup
-- Exit code mapping to Jenkins build status
-- All data persists in database (no external storage needed)
 
 ## Database Tables
 
