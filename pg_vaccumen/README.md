@@ -261,11 +261,11 @@ Requirements:
 
 ```bash
 # Dry-run (default) - shows what would be vacuumed
-python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
+python pg_vaccumen.py --host mydb.cluster-xxx.us-east-1.rds.amazonaws.com \
     --database mydb --db-username postgres --db-password secret
 
 # Execute vacuum
-python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
+python pg_vaccumen.py --host mydb.cluster-xxx.us-east-1.rds.amazonaws.com \
     --database mydb --db-username postgres --db-password secret --execute
 
 # Using AWS cluster lookup (requires IAM permissions)
@@ -281,7 +281,7 @@ python pg_vaccumen.py --cluster my-aurora-cluster --database mydb
 | `--cluster` | Aurora cluster identifier (uses boto3 to lookup endpoint) |
 | `--host` | Database host (bypasses AWS lookup) |
 | `--database` | Database name (required) |
-| `--region` | AWS region (default: us-west-2) |
+| `--region` | AWS region (default: us-east-1) |
 | `--db-username` | Database username (default: postgres) |
 | `--db-password` | Database password (required with --host, otherwise uses Secrets Manager) |
 

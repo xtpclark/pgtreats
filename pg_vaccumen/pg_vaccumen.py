@@ -640,7 +640,7 @@ Exit codes:
     parser.add_argument("--cluster", help="Aurora cluster identifier (required unless --host specified)")
     parser.add_argument("--host", help="Database host (bypasses AWS cluster lookup)")
     parser.add_argument("--database", required=True, help="Database name")
-    parser.add_argument("--region", default="us-west-2", help="AWS region")
+    parser.add_argument("--region", default="us-east-1", help="AWS region")
     parser.add_argument("--db-username", default="postgres", help="Database username")
     parser.add_argument("--db-password", help="Database password (required when using --host)")
     parser.add_argument("--limit", type=int, default=10, help="Max tables to vacuum per run")
