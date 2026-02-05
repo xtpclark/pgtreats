@@ -217,7 +217,7 @@ python pg_vaccumen.py --host ... --database mydb \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--execute` | Off | Actually run vacuum (default is dry-run) |
-| `--workers` | 1 | Parallel vacuum workers (**see warnings below**). Capped at 8; auto-reduced if unsafe |
+| `--workers` | 1 | Parallel vacuum workers — **global limit** across all instances via advisory locks. Capped at 8; auto-reduced if unsafe |
 | `--force` | Off | Proceed despite blockers (long txns, replication slots) |
 | `--skip-preflight` | Off | Skip preflight checks (not recommended) |
 | `--statement-timeout` | 0 | Timeout in seconds for vacuum operations (0 = no timeout) |
@@ -261,6 +261,8 @@ python pg_vaccumen.py --host ... --database mydb \
 | `--check-bloat` shows many tables >50% | Autovacuum may be under-resourced — review `autovacuum_vacuum_cost_delay` and worker counts |
 | Large backlog, need to catch up faster | Try `--workers 2`, monitor I/O, increase only if headroom exists |
 | I/O latency spikes during parallel vacuum | Reduce `--workers` or return to 1; parallel vacuum is saturating storage |
+| Multiple instances running concurrently | Normal — advisory locks enforce global `--workers` limit. Extra workers wait for slots |
+| "Waiting for vacuum slot" messages | All slots held by other instances. Workers will proceed when a slot frees up |
 
 ## Locking Behavior
 
@@ -368,12 +370,41 @@ python pg_vaccumen.py --host ... --database mydb --execute --workers 3 --limit 3
 
 **WARNING: Parallel workers multiply I/O load, memory usage, and WAL generation. Do not increase workers without understanding the impact on your database.**
 
+### Global concurrency limit (advisory locks)
+
+`--workers N` is a **global limit**, not per-instance. All pg_vaccumen instances on the same database coordinate via PostgreSQL advisory locks. Before each VACUUM, a worker must acquire one of N numbered lock slots. If all slots are held, the worker waits and reports:
+
+```
+           Waiting for vacuum slot (2/2 in use)... tracker_state_cache
+           Acquired vacuum slot 0
+```
+
+**What this means in practice:**
+
+| Scenario | Concurrent VACUUMs |
+|----------|--------------------|
+| 1 instance, `--workers 2` | Up to 2 |
+| 3 instances, `--workers 2` | Still only 2 — extra workers wait for slots |
+| Cron overlap (previous run still going) | New run waits gracefully instead of dogpiling |
+
+Slot status is reported before execution starts:
+
+```
+Global vacuum slots: 1/2 in use (advisory locks)
+```
+
+Advisory locks auto-release when a connection closes (including crashes), so there is no stale state to clean up.
+
+**Important:** All instances should use the same `--workers` value. If one instance uses `--workers 2` and another uses `--workers 4`, the effective limit is the higher value (4), since the second instance can access slots 2-3 that the first doesn't contend for.
+
 ### What happens with multiple workers
 
 - Each worker opens a separate database connection
+- Each worker acquires a global advisory lock slot before executing VACUUM
 - Each worker runs `VACUUM ANALYZE VERBOSE` on a different table concurrently
 - PostgreSQL handles locking — different tables don't conflict
 - Workers automatically skip tables already being vacuumed (by autovacuum or another worker)
+- Workers detect vacuums started by other instances in real-time (live `pg_stat_activity` check per table)
 
 ### Safety checks (automatic)
 
@@ -708,7 +739,7 @@ The included `Jenkinsfile` provides a parameterized pipeline for nightly runs.
 | `NO_SKIP_AUTOVACUUM` | false | Don't skip tables being vacuumed by autovacuum |
 | `CHECK_BLOAT` | false | Analyze tables for dead tuple bloat |
 | `BLOAT_PCT` | 50 | Dead tuple percentage threshold for bloat analysis |
-| `WORKERS` | 1 | Parallel vacuum workers (**see warnings below**) |
+| `WORKERS` | 1 | Parallel vacuum workers — **global limit** via advisory locks |
 | `EXECUTE` | false | Actually vacuum (false = dry-run) |
 | `FORCE` | false | Proceed despite blockers |
 | `SKIP_PREFLIGHT` | false | Skip preflight checks |
