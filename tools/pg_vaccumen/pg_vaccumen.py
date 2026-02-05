@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +86,18 @@ class AlertStatus:
     level: str  # "ok", "warning", "critical"
     exit_code: int
     message: str
+
+
+@dataclass
+class BloatedTable:
+    """A table with high dead tuple ratio indicating file-level bloat."""
+    table_name: str
+    total_size_bytes: int
+    n_live_tup: int
+    n_dead_tup: int
+    dead_pct: float
+    last_vacuum: str | None
+    last_autovacuum: str | None
 
 
 def get_cluster_endpoint(cluster: str, region: str) -> str:
@@ -363,6 +378,7 @@ def generate_recommendations(
     tables_total: int,
     tables_limit: int,
     threshold: int,
+    bloated_tables: list[BloatedTable] | None = None,
 ) -> list[str]:
     """Generate tuning recommendations based on current state."""
     recommendations = []
@@ -411,6 +427,32 @@ def generate_recommendations(
             f"Table selection threshold ({threshold_pct}%) is high and tables are exceeding it. "
             f"Consider lowering threshold to catch tables earlier."
         )
+
+    # Bloat recommendations
+    if bloated_tables:
+        severely_bloated = [t for t in bloated_tables if t.dead_pct > 80]
+        if severely_bloated:
+            names = ", ".join(t.table_name for t in severely_bloated[:3])
+            recommendations.append(
+                f"{len(severely_bloated)} table(s) have >80% dead tuples ({names}). "
+                f"These likely need pg_repack or VACUUM FULL to reclaim disk space."
+            )
+
+        recently_vacuumed_bloated = [
+            t for t in bloated_tables
+            if t.last_vacuum or t.last_autovacuum
+        ]
+        if recently_vacuumed_bloated:
+            total_dead_bytes = sum(
+                int(t.total_size_bytes * t.dead_pct / 100)
+                for t in bloated_tables
+            )
+            dead_gb = total_dead_bytes / (1024 * 1024 * 1024)
+            if dead_gb >= 1.0:
+                recommendations.append(
+                    f"Estimated ~{dead_gb:.1f} GB of dead space across {len(bloated_tables)} bloated table(s). "
+                    f"Regular VACUUM marks this reusable but does not shrink the files."
+                )
 
     return recommendations
 
@@ -517,6 +559,83 @@ def get_tables_to_vacuum(
         return tables, total_count, size_excluded
 
 
+def get_bloated_tables(
+    conn: psycopg.Connection,
+    bloat_pct: float,
+) -> list[BloatedTable]:
+    """Query tables with high dead tuple ratios indicating file-level bloat.
+
+    Args:
+        conn: Database connection.
+        bloat_pct: Minimum dead tuple percentage to include a table.
+
+    Returns:
+        List of BloatedTable ordered by dead_pct descending.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            select s.schemaname || '.' || s.relname as table_name,
+                   pg_total_relation_size(c.oid) as total_size_bytes,
+                   s.n_live_tup,
+                   s.n_dead_tup,
+                   round(100.0 * s.n_dead_tup / (s.n_live_tup + s.n_dead_tup), 1) as dead_pct,
+                   s.last_vacuum::text,
+                   s.last_autovacuum::text
+            from pg_stat_user_tables s
+            join pg_class c on c.oid = s.relid
+            where s.n_dead_tup > 10000
+              and s.n_live_tup + s.n_dead_tup > 0
+              and 100.0 * s.n_dead_tup / (s.n_live_tup + s.n_dead_tup) > %s
+            order by dead_pct desc
+        """, (bloat_pct,))
+        return [
+            BloatedTable(
+                table_name=row[0],
+                total_size_bytes=row[1],
+                n_live_tup=row[2],
+                n_dead_tup=row[3],
+                dead_pct=float(row[4]),
+                last_vacuum=row[5],
+                last_autovacuum=row[6],
+            )
+            for row in cur.fetchall()
+        ]
+
+
+def print_bloat_report(tables: list[BloatedTable], bloat_pct: float) -> None:
+    """Print bloat analysis report."""
+    print()
+    print("=" * 100)
+    print(f"BLOAT ANALYSIS (tables with >{bloat_pct:.0f}% dead tuples)")
+    print("=" * 100)
+    print()
+
+    if not tables:
+        print(f"No tables found with >{bloat_pct:.0f}% dead tuples (minimum 10,000 dead tuples).")
+        print()
+        return
+
+    print(f"{'Table':<40} {'Dead %':>8} {'Dead Tups':>14} {'Live Tups':>14} {'Size':>12}  {'Last Vacuum'}")
+    print("-" * 100)
+    for t in tables:
+        size_gb = t.total_size_bytes / (1024 * 1024 * 1024)
+        if size_gb >= 1.0:
+            size_str = f"{size_gb:.1f} GB"
+        else:
+            size_str = f"{t.total_size_bytes / (1024 * 1024):.1f} MB"
+        last_vac = t.last_vacuum or t.last_autovacuum or "(never)"
+        # Truncate timestamp to date only for display
+        if last_vac != "(never)":
+            last_vac = last_vac[:10]
+        print(f"{t.table_name:<40} {t.dead_pct:>7.1f}% {t.n_dead_tup:>14,} {t.n_live_tup:>14,} {size_str:>12}  {last_vac}")
+    print("-" * 100)
+    print(f"{len(tables)} table(s) with >{bloat_pct:.0f}% dead tuples")
+    print()
+    print("Tables with high dead tuple ratios after recent vacuum likely have file-level bloat.")
+    print("Consider pg_repack or VACUUM FULL to reclaim space.")
+    print()
+
+
 @dataclass
 class VacuumMetric:
     """Metrics from a single vacuum operation."""
@@ -529,20 +648,31 @@ class VacuumMetric:
     host: str
 
 
-def get_autovacuum_tables(conn: psycopg.Connection) -> dict[str, int]:
-    """Query pg_stat_activity for tables currently being vacuumed by autovacuum.
+@dataclass
+class VacuumActivity:
+    """A table currently being vacuumed."""
+    pid: int
+    source: str  # "autovacuum" or "manual"
+
+
+def get_vacuum_activity(conn: psycopg.Connection) -> dict[str, VacuumActivity]:
+    """Query pg_stat_activity for tables currently being vacuumed.
+
+    Detects both autovacuum workers and manual VACUUM from other sessions.
 
     Returns:
-        Dict mapping schema-qualified table name to autovacuum worker PID.
+        Dict mapping table name to VacuumActivity (PID + source).
     """
+    result: dict[str, VacuumActivity] = {}
+
     with conn.cursor() as cur:
+        # Autovacuum workers
         cur.execute("""
             select query, pid
             from pg_stat_activity
             where backend_type = 'autovacuum worker'
               and query like 'autovacuum:%%'
         """)
-        result = {}
         for query_text, pid in cur.fetchall():
             # Format: "autovacuum: VACUUM public.table_name"
             # or:     "autovacuum: VACUUM public.table_name (to prevent wraparound)"
@@ -550,14 +680,104 @@ def get_autovacuum_tables(conn: psycopg.Connection) -> dict[str, int]:
             for i, part in enumerate(parts):
                 if part.upper() in ('VACUUM', 'ANALYZE') and i + 1 < len(parts):
                     table_name = parts[i + 1]
-                    # Store both schema-qualified and bare name for matching
-                    # oid::regclass::text returns bare name for public schema
-                    result[table_name] = pid
+                    activity = VacuumActivity(pid=pid, source="autovacuum")
+                    result[table_name] = activity
                     if '.' in table_name:
                         bare_name = table_name.split('.', 1)[1]
-                        result[bare_name] = pid
+                        result[bare_name] = activity
                     break
-        return result
+
+        # Manual VACUUM from other sessions (e.g. another pg_vaccumen instance)
+        cur.execute("""
+            select query, pid
+            from pg_stat_activity
+            where pid != pg_backend_pid()
+              and query ilike 'vacuum%%'
+              and backend_type = 'client backend'
+        """)
+        for query_text, pid in cur.fetchall():
+            # Format: "vacuum (verbose, analyze) public.table_name"
+            # or:     "VACUUM public.table_name"
+            # Table name is always the last token in the query
+            parts = query_text.strip().split()
+            table_name = parts[-1] if parts else None
+            # Skip if the "table name" is actually a VACUUM keyword/option
+            if table_name and table_name.strip('(),').upper() in ('VACUUM', 'VERBOSE', 'ANALYZE', 'FREEZE', 'FULL', ''):
+                table_name = None
+            if table_name:
+                activity = VacuumActivity(pid=pid, source="manual")
+                result[table_name] = activity
+                if '.' in table_name:
+                    bare_name = table_name.split('.', 1)[1]
+                    result[bare_name] = activity
+
+    return result
+
+
+MAX_WORKERS = 8  # Hard cap regardless of what user requests
+
+
+def validate_workers(conn: psycopg.Connection, requested: int) -> int:
+    """Validate --workers count against system resources. Returns safe worker count."""
+    if requested <= 1:
+        return 1
+
+    warnings: list[str] = []
+
+    # Hard cap
+    if requested > MAX_WORKERS:
+        warnings.append(f"--workers {requested} exceeds hard cap of {MAX_WORKERS}")
+        requested = MAX_WORKERS
+
+    # Check maintenance_work_mem — each VACUUM uses up to this much
+    with conn.cursor() as cur:
+        cur.execute("show maintenance_work_mem")
+        mwm_str = cur.fetchone()[0]  # e.g. "64MB", "1GB"
+        mwm_str = mwm_str.upper().strip()
+        if mwm_str.endswith("GB"):
+            mwm_mb = int(mwm_str.replace("GB", "")) * 1024
+        elif mwm_str.endswith("MB"):
+            mwm_mb = int(mwm_str.replace("MB", ""))
+        elif mwm_str.endswith("KB"):
+            mwm_mb = int(mwm_str.replace("KB", "")) // 1024
+        else:
+            mwm_mb = int(mwm_str) // 1024  # bytes
+
+        total_mb = mwm_mb * requested
+        # Warn if total memory exceeds 2 GB
+        if total_mb > 2048:
+            safe = max(1, 2048 // mwm_mb)
+            warnings.append(
+                f"maintenance_work_mem={mwm_str} x {requested} workers = {total_mb} MB "
+                f"(>{2048} MB). Reducing to {safe} workers"
+            )
+            requested = safe
+
+    # Check max_connections headroom
+    with conn.cursor() as cur:
+        cur.execute("show max_connections")
+        max_conns = int(cur.fetchone()[0])
+        cur.execute("select count(*) from pg_stat_activity")
+        active_conns = cur.fetchone()[0]
+        available = max_conns - active_conns
+        # Need 'requested' extra connections (main conn already exists)
+        if requested > available - 5:  # keep 5 as safety margin
+            safe = max(1, available - 5)
+            warnings.append(
+                f"Only {available} connections available ({active_conns}/{max_conns} in use). "
+                f"Reducing to {safe} workers"
+            )
+            requested = safe
+
+    if warnings:
+        for w in warnings:
+            print(f"WARNING: {w}", file=sys.stderr)
+        if requested <= 1:
+            print("WARNING: Falling back to single-worker mode", file=sys.stderr)
+            return 1
+        print(f"Using {requested} workers", file=sys.stderr)
+
+    return requested
 
 
 def get_table_size(conn: psycopg.Connection, table: str) -> int:
@@ -759,6 +979,25 @@ Exit codes:
         help="Don't skip tables currently being vacuumed by autovacuum (default: skip them)",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel vacuum workers (default: 1). "
+             "Each worker uses a separate connection and maintenance_work_mem. "
+             "Capped at 8; auto-reduced if memory or connections insufficient.",
+    )
+    parser.add_argument(
+        "--check-bloat",
+        action="store_true",
+        help="Analyze tables for dead tuple bloat (high dead/live ratio)",
+    )
+    parser.add_argument(
+        "--bloat-pct",
+        type=float,
+        default=50.0,
+        help="Dead tuple percentage threshold for bloat analysis (default: 50.0)",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="Execute vacuum (default is dry-run mode)",
@@ -894,6 +1133,11 @@ Exit codes:
             print(f"Max table size: {args.max_size} GB")
         if not args.no_skip_autovacuum:
             print(f"Skip autovacuum targets: yes")
+
+        # Validate and possibly reduce worker count
+        workers = validate_workers(conn, args.workers) if args.execute else args.workers
+        if workers > 1:
+            print(f"Parallel workers: {workers}")
         print()
 
         if not args.skip_preflight:
@@ -925,9 +1169,14 @@ Exit codes:
             conn, threshold, args.limit, max_size_bytes
         )
 
-        # Get autovacuum worker info for annotation
+        # Get vacuum activity (autovacuum + manual) for annotation and skip logic
         skip_autovacuum = not args.no_skip_autovacuum
-        autovac_tables = get_autovacuum_tables(conn) if skip_autovacuum else {}
+        vacuum_activity = get_vacuum_activity(conn) if skip_autovacuum else {}
+
+        # Run bloat analysis if requested
+        bloated_tables: list[BloatedTable] | None = None
+        if args.check_bloat:
+            bloated_tables = get_bloated_tables(conn, args.bloat_pct)
 
         if not tables:
             print(f"No tables exceed threshold ({threshold:,})")
@@ -935,8 +1184,14 @@ Exit codes:
                 print(f"  ({size_excluded} table(s) excluded by --max-size {args.max_size} GB)")
             print("Proactive maintenance is keeping up with transaction load.")
 
+            if bloated_tables is not None:
+                print_bloat_report(bloated_tables, args.bloat_pct)
+
             # Still show recommendations even with no tables
-            recommendations = generate_recommendations(preflight, 0, 0, args.limit, threshold)
+            recommendations = generate_recommendations(
+                preflight, 0, 0, args.limit, threshold,
+                bloated_tables=bloated_tables,
+            )
             if recommendations:
                 print()
                 print("=" * 80)
@@ -965,15 +1220,25 @@ Exit codes:
                 size_str = f"{size_gb:.1f} GB"
             else:
                 size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
-            note = "[autovacuum running]" if table in autovac_tables else ""
+            if table in vacuum_activity:
+                src = vacuum_activity[table].source
+                note = f"[{src} vacuum running]"
+            else:
+                note = ""
             print(f"{table:<40} {age:>15,} {pct:>9}% {size_str:>12} {note}")
         print("-" * 100)
         if total_count > len(tables):
             print(f"  ... and {total_count - len(tables)} more table(s) waiting")
         print()
 
+        if bloated_tables is not None:
+            print_bloat_report(bloated_tables, args.bloat_pct)
+
         # Show recommendations
-        recommendations = generate_recommendations(preflight, len(tables), total_count, args.limit, threshold)
+        recommendations = generate_recommendations(
+            preflight, len(tables), total_count, args.limit, threshold,
+            bloated_tables=bloated_tables,
+        )
         if recommendations:
             print("=" * 80)
             print("RECOMMENDATIONS")
@@ -990,64 +1255,159 @@ Exit codes:
         if args.metrics_to_db:
             ensure_metrics_table(conn)
 
-        # Re-check autovacuum workers right before execution
+        # Re-check vacuum activity right before execution
         if skip_autovacuum:
-            autovac_tables = get_autovacuum_tables(conn)
+            vacuum_activity = get_vacuum_activity(conn)
 
-        print("Executing vacuum...")
-        print("=" * 80)
+        # Shared result accumulators
         metrics: list[VacuumMetric] = []
         total_duration = 0.0
         collect_metrics = args.metrics_file or args.metrics_to_db
-
         failed_tables: list[tuple[str, str]] = []
-        skipped_tables: list[tuple[str, int]] = []  # (table, autovacuum_pid)
+        skipped_tables: list[tuple[str, int, str]] = []  # (table, pid, source)
 
-        for i, (table, age, size_bytes) in enumerate(tables, 1):
-            pct = age * 100 // preflight.autovacuum_freeze_max_age
-            size_mb = size_bytes / (1024 * 1024)
+        if workers <= 1:
+            # --- Sequential execution (single worker) ---
+            print("Executing vacuum...")
+            print("=" * 80)
 
-            # Skip tables currently being vacuumed by autovacuum
-            if skip_autovacuum and table in autovac_tables:
-                pid = autovac_tables[table]
-                print(f"\n[{i}/{len(tables)}] SKIP {table}")
-                print(f"           Autovacuum already running (PID {pid})")
-                skipped_tables.append((table, pid))
-                continue
+            for i, (table, age, size_bytes) in enumerate(tables, 1):
+                pct = age * 100 // preflight.autovacuum_freeze_max_age
+                size_mb = size_bytes / (1024 * 1024)
 
-            print(f"\n[{i}/{len(tables)}] VACUUM ANALYZE VERBOSE {table}")
-            print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
-            print("-" * 80)
+                if skip_autovacuum and table in vacuum_activity:
+                    activity = vacuum_activity[table]
+                    print(f"\n[{i}/{len(tables)}] SKIP {table}")
+                    print(f"           {activity.source.capitalize()} vacuum already running (PID {activity.pid})")
+                    skipped_tables.append((table, activity.pid, activity.source))
+                    continue
 
-            try:
-                duration = vacuum_table(conn, table, args.statement_timeout)
-                total_duration += duration
-                print(f"           Completed in {duration:.1f}s")
+                print(f"\n[{i}/{len(tables)}] VACUUM ANALYZE VERBOSE {table}")
+                print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
+                print("-" * 80)
 
-                if collect_metrics:
-                    metrics.append(VacuumMetric(
-                        timestamp=datetime.now().isoformat(),
-                        table=table,
-                        age_before=age,
-                        size_bytes=size_bytes,
-                        duration_seconds=round(duration, 2),
-                        database=args.database,
-                        host=endpoint,
-                    ))
-            except Exception as e:
-                print(f"           FAILED: {e}")
-                failed_tables.append((table, str(e)))
+                try:
+                    duration = vacuum_table(conn, table, args.statement_timeout)
+                    total_duration += duration
+                    print(f"           Completed in {duration:.1f}s")
 
+                    if collect_metrics:
+                        metrics.append(VacuumMetric(
+                            timestamp=datetime.now().isoformat(),
+                            table=table,
+                            age_before=age,
+                            size_bytes=size_bytes,
+                            duration_seconds=round(duration, 2),
+                            database=args.database,
+                            host=endpoint,
+                        ))
+                except Exception as e:
+                    print(f"           FAILED: {e}")
+                    failed_tables.append((table, str(e)))
+
+        else:
+            # --- Parallel execution (multiple workers) ---
+            print(f"Executing vacuum with {workers} parallel workers...")
+            print("=" * 80)
+
+            # Pre-filter skipped tables
+            tables_to_run: list[tuple[int, str, int, int]] = []
+            for i, (table, age, size_bytes) in enumerate(tables, 1):
+                if skip_autovacuum and table in vacuum_activity:
+                    activity = vacuum_activity[table]
+                    print(f"SKIP {table} — {activity.source} vacuum already running (PID {activity.pid})")
+                    skipped_tables.append((table, activity.pid, activity.source))
+                else:
+                    tables_to_run.append((i, table, age, size_bytes))
+
+            if not tables_to_run:
+                print("All tables already being vacuumed — nothing to do.")
+            else:
+                # Create dedicated connections for workers
+                worker_conns: list[psycopg.Connection] = []
+                try:
+                    for _ in range(workers):
+                        wconn = psycopg.connect(
+                            host=endpoint,
+                            dbname=args.database,
+                            user=args.db_username,
+                            password=password,
+                            sslmode="prefer",
+                        )
+                        worker_conns.append(wconn)
+                except Exception as e:
+                    print(f"ERROR: Failed to create worker connections: {e}", file=sys.stderr)
+                    for wc in worker_conns:
+                        wc.close()
+                    return 1
+
+                conn_pool: queue.Queue[psycopg.Connection] = queue.Queue()
+                for wc in worker_conns:
+                    conn_pool.put(wc)
+
+                print_lock = threading.Lock()
+
+                def _vacuum_one(
+                    tbl: str, age: int, size_bytes: int, index: int,
+                ) -> tuple[float | None, str | None]:
+                    pct = age * 100 // preflight.autovacuum_freeze_max_age
+                    size_mb = size_bytes / (1024 * 1024)
+                    wconn = conn_pool.get()
+                    try:
+                        with print_lock:
+                            print(f"\n[{index}/{len(tables)}] VACUUM ANALYZE VERBOSE {tbl}")
+                            print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
+                        duration = vacuum_table(wconn, tbl, args.statement_timeout)
+                        with print_lock:
+                            print(f"           [{tbl}] Completed in {duration:.1f}s")
+                        return duration, None
+                    except Exception as e:
+                        with print_lock:
+                            print(f"           [{tbl}] FAILED: {e}")
+                        return None, str(e)
+                    finally:
+                        conn_pool.put(wconn)
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(_vacuum_one, tbl, age, sz, idx): (tbl, age, sz)
+                        for idx, tbl, age, sz in tables_to_run
+                    }
+
+                    for future in as_completed(futures):
+                        tbl, age, sz = futures[future]
+                        duration, error = future.result()
+                        if error:
+                            failed_tables.append((tbl, error))
+                        else:
+                            total_duration += duration
+                            if collect_metrics:
+                                metrics.append(VacuumMetric(
+                                    timestamp=datetime.now().isoformat(),
+                                    table=tbl,
+                                    age_before=age,
+                                    size_bytes=sz,
+                                    duration_seconds=round(duration, 2),
+                                    database=args.database,
+                                    host=endpoint,
+                                ))
+
+                # Close worker connections
+                for wc in worker_conns:
+                    wc.close()
+
+        # --- Summary (shared by both paths) ---
         print()
         print("=" * 80)
         vacuumed = len(tables) - len(failed_tables) - len(skipped_tables)
-        print(f"Vacuum complete: {vacuumed}/{len(tables)} tables in {total_duration:.1f}s")
+        worker_note = f" ({workers} workers)" if workers > 1 else ""
+        print(f"Vacuum complete: {vacuumed}/{len(tables)} tables in {total_duration:.1f}s{worker_note}")
 
         if skipped_tables:
             print()
-            print(f"SKIPPED (autovacuum running): {len(skipped_tables)}")
-            for table, pid in skipped_tables:
-                print(f"  - {table} (PID {pid})")
+            print(f"SKIPPED (vacuum already running): {len(skipped_tables)}")
+            for table, pid, source in skipped_tables:
+                print(f"  - {table} ({source} PID {pid})")
 
         if failed_tables:
             print()

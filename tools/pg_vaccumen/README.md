@@ -205,14 +205,22 @@ python pg_vaccumen.py --host ... --database mydb \
 | `--max-size` | No limit | Skip tables larger than this size in GB |
 | `--no-skip-autovacuum` | Skip enabled | Don't skip tables currently being vacuumed by autovacuum |
 
+### Bloat Analysis Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--check-bloat` | Off | Analyze tables for dead tuple bloat (high dead/live ratio) |
+| `--bloat-pct` | 50.0 | Dead tuple percentage threshold for bloat analysis |
+
 ### Execution Options
 
-| Option | Description |
-|--------|-------------|
-| `--execute` | Actually run vacuum (default is dry-run) |
-| `--force` | Proceed despite blockers (long txns, replication slots) |
-| `--skip-preflight` | Skip preflight checks (not recommended) |
-| `--statement-timeout` | Timeout in seconds for vacuum operations (default: 0 = no timeout) |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--execute` | Off | Actually run vacuum (default is dry-run) |
+| `--workers` | 1 | Parallel vacuum workers (**see warnings below**). Capped at 8; auto-reduced if unsafe |
+| `--force` | Off | Proceed despite blockers (long txns, replication slots) |
+| `--skip-preflight` | Off | Skip preflight checks (not recommended) |
+| `--statement-timeout` | 0 | Timeout in seconds for vacuum operations (0 = no timeout) |
 
 ### Transaction Rate Tracking
 
@@ -249,6 +257,10 @@ python pg_vaccumen.py --host ... --database mydb \
 | A few huge tables dominate the queue | Use `--max-size` to skip them, let autovacuum handle |
 | Many tables skipped (autovacuum running) | Autovacuum is keeping up — focus `--limit` on remaining tables |
 | Tables excluded by size need vacuuming | Run a separate job without `--max-size` during a longer window |
+| High dead tuple ratio after recent vacuum | File-level bloat — use `pg_repack` or `VACUUM FULL` to reclaim space |
+| `--check-bloat` shows many tables >50% | Autovacuum may be under-resourced — review `autovacuum_vacuum_cost_delay` and worker counts |
+| Large backlog, need to catch up faster | Try `--workers 2`, monitor I/O, increase only if headroom exists |
+| I/O latency spikes during parallel vacuum | Reduce `--workers` or return to 1; parallel vacuum is saturating storage |
 
 ## Locking Behavior
 
@@ -344,6 +356,174 @@ Two features solve this:
 | Autovacuum already handling the biggest tables | Let auto-skip handle it (default) |
 | Both huge tables and active autovacuum | Use both — `--max-size 500` filters the monsters, auto-skip handles the rest |
 | You want to vacuum everything, including monsters | `--no-skip-autovacuum` and omit `--max-size` |
+
+## Parallel Workers (`--workers`)
+
+By default, pg_vaccumen vacuums one table at a time. Use `--workers N` to vacuum multiple tables concurrently when catching up on a large backlog.
+
+```bash
+# Vacuum 3 tables at a time (use with caution)
+python pg_vaccumen.py --host ... --database mydb --execute --workers 3 --limit 30
+```
+
+**WARNING: Parallel workers multiply I/O load, memory usage, and WAL generation. Do not increase workers without understanding the impact on your database.**
+
+### What happens with multiple workers
+
+- Each worker opens a separate database connection
+- Each worker runs `VACUUM ANALYZE VERBOSE` on a different table concurrently
+- PostgreSQL handles locking — different tables don't conflict
+- Workers automatically skip tables already being vacuumed (by autovacuum or another worker)
+
+### Safety checks (automatic)
+
+The script automatically validates `--workers` before execution and reduces the count if:
+
+| Check | Limit | What happens |
+|-------|-------|--------------|
+| Hard cap | 8 workers max | Values above 8 are silently reduced |
+| Memory | `maintenance_work_mem` x workers < 2 GB | Reduced to fit within 2 GB total |
+| Connections | Must leave 5 free connections | Reduced if `max_connections` headroom is tight |
+
+If any check reduces workers to 1, a warning is printed and it falls back to sequential mode.
+
+### I/O impact
+
+**This is the primary risk.** VACUUM is I/O-intensive — it reads pages, writes frozen pages, and generates WAL. Multiple concurrent vacuums multiply all of this.
+
+| Concern | Detail |
+|---------|--------|
+| **Disk throughput** | Aurora storage is network-attached. Too many concurrent vacuums can saturate I/O and slow production queries |
+| **WAL generation** | More concurrent vacuums = more WAL = more replication lag to replicas and logical subscribers |
+| **I/O credits** | Some Aurora instance types have burst I/O. Aggressive parallel vacuum can exhaust credits |
+| **Memory** | Each VACUUM uses up to `maintenance_work_mem` (check `SHOW maintenance_work_mem`). 4 workers x 256 MB = 1 GB |
+
+### Recommended settings
+
+| Scenario | Workers | Why |
+|----------|---------|-----|
+| **Nightly maintenance (steady state)** | 1 | No need for parallelism when caught up |
+| **Catching up on backlog (< 50 tables)** | 2 | Modest speedup, minimal I/O risk |
+| **Catching up on backlog (100+ tables)** | 2-3 | Monitor I/O before going higher |
+| **Emergency catch-up during maintenance window** | 3-4 | Only with active I/O monitoring |
+| **Never** | >4 | Diminishing returns, real I/O contention risk |
+
+### How to monitor impact
+
+While running parallel workers, watch for:
+
+```sql
+-- I/O wait (are queries waiting for disk?)
+SELECT wait_event_type, wait_event, count(*)
+FROM pg_stat_activity
+WHERE state = 'active'
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+
+-- Replication lag (are subscribers falling behind?)
+SELECT slot_name, active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM pg_replication_slots
+WHERE slot_type = 'logical';
+```
+
+In CloudWatch, watch `ReadIOPS`, `WriteIOPS`, `ReadLatency`, and `WriteLatency` for the Aurora instance. If latency spikes, reduce workers.
+
+## Killing a Running Vacuum
+
+Sometimes you need to stop a vacuum in progress — maybe it's been running for hours on a huge table, I/O is spiking, or you need to run DDL. Here's what you need to know.
+
+### Is it safe to kill a VACUUM?
+
+**Yes.** Regular `VACUUM` (not `VACUUM FULL`) is crash-safe. PostgreSQL uses WAL for all changes, so an interrupted vacuum cannot corrupt data. However, the consequences depend on *how much work the vacuum had completed*:
+
+| What happens on interrupt | Detail |
+|---------------------------|--------|
+| Dead tuple cleanup | **Preserved.** Pages already processed have dead tuples marked as reusable. This work is not lost. |
+| Row freezing | **Preserved for processed pages.** Rows already frozen stay frozen. |
+| `relfrozenxid` advancement | **Not preserved.** This only updates at the *end* of a complete vacuum. If interrupted, the table's age stays at the pre-vacuum value. |
+| Table visibility map | **Preserved for processed pages.** Pages marked all-visible stay that way. |
+
+**Bottom line:** Killing a vacuum wastes the *freeze progress* (the whole point of this script), but does not waste dead tuple cleanup. The table will be selected again on the next run.
+
+### How to kill a vacuum
+
+**Option 1: Kill the pg_vaccumen script**
+
+```bash
+# Ctrl+C in the terminal running pg_vaccumen
+# Or from another terminal:
+kill <pg_vaccumen_pid>
+```
+
+What happens when the script is killed:
+
+| Signal | Python behavior | PostgreSQL behavior |
+|--------|----------------|---------------------|
+| `Ctrl+C` / `SIGINT` | KeyboardInterrupt raised, `with psycopg.connect()` context manager closes connection | Connection closed → backend receives cancel → in-flight VACUUM stops |
+| `SIGTERM` (`kill`) | Same as above — Python handles SIGTERM, connection closed gracefully | Same — VACUUM stops when connection closes |
+| `SIGKILL` (`kill -9`) | Python dies immediately, no cleanup | TCP connection stays open. VACUUM **continues running** until PostgreSQL detects the dead connection (via `tcp_keepalives_idle`, typically 2+ minutes) |
+
+With `--workers > 1`, killing the script closes all worker connections, canceling all in-flight vacuums (except with `kill -9`, where all of them keep running until PostgreSQL times out the connections).
+
+**Option 2: Cancel a specific vacuum in PostgreSQL**
+
+If you want to stop one vacuum but let others continue (e.g., one huge table is dominating I/O):
+
+```sql
+-- Find the vacuum to cancel
+SELECT pid, query, now() - query_start AS duration
+FROM pg_stat_activity
+WHERE query ILIKE 'vacuum%'
+ORDER BY query_start;
+
+-- Graceful cancel (vacuum rolls back cleanly)
+SELECT pg_cancel_backend(<pid>);
+
+-- Forceful terminate (kills the connection)
+SELECT pg_terminate_backend(<pid>);
+```
+
+Prefer `pg_cancel_backend()` — it sends a cancel signal and the vacuum stops gracefully. Use `pg_terminate_backend()` only if cancel doesn't work (rare).
+
+**Option 3: Use `--statement-timeout`**
+
+The safest approach is to set a timeout upfront so vacuums that take too long are killed automatically:
+
+```bash
+# Kill any vacuum that takes longer than 30 minutes
+python pg_vaccumen.py --host ... --execute --statement-timeout 1800
+```
+
+Tables that time out are reported as FAILED and will be retried on the next run.
+
+### When to kill a vacuum
+
+| Situation | Recommendation |
+|-----------|----------------|
+| Vacuum running for hours on a huge table | Consider letting it finish — killing means it restarts from scratch next run. Use `--statement-timeout` for future runs. |
+| I/O spike affecting production queries | Cancel the vacuum. Production performance takes priority. The table will be picked up next run. |
+| Need to run DDL (ALTER TABLE, etc.) | Cancel the vacuum on that specific table. DDL waits for `ShareUpdateExclusiveLock` to release. |
+| Script is stuck / not progressing | Check `pg_stat_activity` — the vacuum may be waiting for a lock. Cancel it and investigate. |
+| Emergency / need connections back | Kill the script. With `--workers`, each worker holds a connection. |
+
+### When NOT to kill a vacuum
+
+| Situation | Why not |
+|-----------|---------|
+| Vacuum is 80%+ done on a large table | Killing means all that freeze work is lost. `relfrozenxid` only advances when the vacuum *completes*. |
+| Table is close to `autovacuum_freeze_max_age` | You need this vacuum to finish. If it's taking too long, let it run — emergency autovacuum will be worse. |
+| "It's been running for an hour" | That may be normal for large tables. Check the table size first. 100+ GB tables can legitimately take hours. |
+
+### What happens to a killed vacuum on the next run
+
+The table will be selected again (its `relfrozenxid` age hasn't changed) and vacuum will restart from the beginning. Dead tuple cleanup from the interrupted vacuum is preserved, so the restart may be faster.
+
+If a table consistently times out, consider:
+
+1. Running it during a longer maintenance window without `--statement-timeout`
+2. Using `--max-size` to skip it in regular runs and handle it separately
+3. Investigating whether the table should be partitioned
 
 ## Blockers: What Prevents Vacuum Progress
 
@@ -526,6 +706,9 @@ The included `Jenkinsfile` provides a parameterized pipeline for nightly runs.
 | `STATEMENT_TIMEOUT` | 0 | Timeout in seconds for vacuum (0 = no timeout) |
 | `MAX_SIZE` | | Skip tables larger than this size in GB (empty = no limit) |
 | `NO_SKIP_AUTOVACUUM` | false | Don't skip tables being vacuumed by autovacuum |
+| `CHECK_BLOAT` | false | Analyze tables for dead tuple bloat |
+| `BLOAT_PCT` | 50 | Dead tuple percentage threshold for bloat analysis |
+| `WORKERS` | 1 | Parallel vacuum workers (**see warnings below**) |
 | `EXECUTE` | false | Actually vacuum (false = dry-run) |
 | `FORCE` | false | Proceed despite blockers |
 | `SKIP_PREFLIGHT` | false | Skip preflight checks |
@@ -747,6 +930,42 @@ Each vacuum appends a JSON record with the same fields.
 | Duration vs size correlation | Validate I/O performance |
 | Duration trends over time | Detect degradation |
 | Tables vacuumed most frequently | Hottest tables for per-table tuning |
+
+## Bloat Analysis
+
+Regular `VACUUM` marks dead tuples as reusable but **does not shrink the table file**. After bulk deletes or heavy updates, tables accumulate "bloat" — wasted disk space that only `pg_repack` or `VACUUM FULL` can reclaim.
+
+Use `--check-bloat` to identify tables with high dead tuple ratios:
+
+```bash
+# Check for tables with >50% dead tuples (default threshold)
+python pg_vaccumen.py --host ... --database mydb --check-bloat
+
+# Lower threshold to see more tables
+python pg_vaccumen.py --host ... --database mydb --check-bloat --bloat-pct 20
+
+# Combine with normal vacuum run
+python pg_vaccumen.py --host ... --database mydb --execute --check-bloat --bloat-pct 30
+```
+
+### How it works
+
+The script queries `pg_stat_user_tables` for the ratio of `n_dead_tup / (n_live_tup + n_dead_tup)`. Tables with more than 10,000 dead tuples exceeding the `--bloat-pct` threshold are reported. No extensions required — works on Aurora without superuser.
+
+### Limitations
+
+- Dead tuple counts are **estimates** from PostgreSQL's statistics collector, not exact values
+- `n_dead_tup` resets after `VACUUM` or `AUTOVACUUM`, so recently vacuumed tables may show low counts even if they have file-level bloat
+- For precise bloat measurement, use `pgstattuple` extension (requires `rds_superuser` on Aurora)
+- This analysis identifies tables that *currently* have high dead tuple ratios — it does not measure historical bloat already reclaimed by vacuum
+
+### When to act
+
+| Dead % | Situation | Action |
+|--------|-----------|--------|
+| >50% | Table accumulating dead tuples faster than vacuum can process | Investigate write patterns, consider more aggressive autovacuum settings |
+| >50% after recent vacuum | File-level bloat — dead space marked reusable but file not shrunk | Consider `pg_repack` (online) or `VACUUM FULL` (blocks writes) |
+| >80% | Severe bloat | Priority candidate for `pg_repack` |
 
 ## Database Tables
 
