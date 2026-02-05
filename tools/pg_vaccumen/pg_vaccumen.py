@@ -15,6 +15,8 @@ Exit codes:
   3 - Critical threshold exceeded (tables at or past autovacuum trigger)
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys
