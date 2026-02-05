@@ -1266,6 +1266,12 @@ Exit codes:
         failed_tables: list[tuple[str, str]] = []
         skipped_tables: list[tuple[str, int, str]] = []  # (table, pid, source)
 
+        # Release main connection from transaction state before the
+        # potentially long-running vacuum loop. Without this, the main
+        # connection sits idle-in-transaction and may be killed by
+        # idle_in_transaction_session_timeout on the server.
+        conn.rollback()
+
         if workers <= 1:
             # --- Sequential execution (single worker) ---
             print("Executing vacuum...")
