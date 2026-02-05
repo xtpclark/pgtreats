@@ -752,6 +752,89 @@ def is_table_being_vacuumed(conn: psycopg.Connection, table: str) -> VacuumActiv
 
 MAX_WORKERS = 8  # Hard cap regardless of what user requests
 
+# Advisory lock namespace for global vacuum slot coordination.
+# All pg_vaccumen instances on the same database share these locks.
+# 0x70675661 = ascii 'pgVa' — unique enough to avoid collisions.
+VACUUM_LOCK_NAMESPACE = 0x70675661
+
+
+def get_vacuum_slots_in_use(conn: psycopg.Connection, max_slots: int) -> list[int]:
+    """Return list of vacuum slot numbers currently held (by any session)."""
+    held: list[int] = []
+    with conn.cursor() as cur:
+        for slot in range(max_slots):
+            # pg_try_advisory_lock acquires if free; we immediately release
+            # if we got it, meaning the slot was NOT held by another session.
+            cur.execute(
+                "select pg_try_advisory_lock(%s, %s)",
+                (VACUUM_LOCK_NAMESPACE, slot),
+            )
+            acquired = cur.fetchone()[0]
+            if acquired:
+                # We got it — slot was free. Release immediately.
+                cur.execute(
+                    "select pg_advisory_unlock(%s, %s)",
+                    (VACUUM_LOCK_NAMESPACE, slot),
+                )
+            else:
+                # Slot is held by another session.
+                held.append(slot)
+    return held
+
+
+def acquire_vacuum_slot(
+    conn: psycopg.Connection, max_slots: int, table: str,
+    print_lock: threading.Lock | None = None, poll_interval: float = 2.0,
+) -> int:
+    """Acquire a global vacuum slot via advisory lock. Blocks until a slot is free.
+
+    Args:
+        conn: Database connection (lock is bound to this session).
+        max_slots: Number of slots (0..max_slots-1).
+        table: Table name (for status messages).
+        print_lock: Thread lock for print synchronization (parallel mode).
+        poll_interval: Seconds between retry attempts.
+
+    Returns:
+        The slot number acquired.
+    """
+    waited = False
+    while True:
+        with conn.cursor() as cur:
+            for slot in range(max_slots):
+                cur.execute(
+                    "select pg_try_advisory_lock(%s, %s)",
+                    (VACUUM_LOCK_NAMESPACE, slot),
+                )
+                if cur.fetchone()[0]:
+                    if waited:
+                        msg = f"           Acquired vacuum slot {slot}"
+                        if print_lock:
+                            with print_lock:
+                                print(msg)
+                        else:
+                            print(msg)
+                    return slot
+        # All slots busy — report and wait
+        if not waited:
+            msg = f"           Waiting for vacuum slot ({max_slots}/{max_slots} in use)... {table}"
+            if print_lock:
+                with print_lock:
+                    print(msg)
+            else:
+                print(msg)
+            waited = True
+        time.sleep(poll_interval)
+
+
+def release_vacuum_slot(conn: psycopg.Connection, slot: int) -> None:
+    """Release a previously acquired vacuum slot."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "select pg_advisory_unlock(%s, %s)",
+            (VACUUM_LOCK_NAMESPACE, slot),
+        )
+
 
 def validate_workers(conn: psycopg.Connection, requested: int) -> int:
     """Validate --workers count against system resources. Returns safe worker count."""
@@ -1287,6 +1370,13 @@ Exit codes:
             print("DRY-RUN: No vacuum performed. Use --execute to run.")
             return alert.exit_code
 
+        # Report global vacuum slot status
+        held_slots = get_vacuum_slots_in_use(conn, workers)
+        if held_slots:
+            print(f"Global vacuum slots: {len(held_slots)}/{workers} in use (advisory locks)")
+        else:
+            print(f"Global vacuum slots: 0/{workers} available")
+
         # Ensure metrics table exists if saving to DB
         if args.metrics_to_db:
             ensure_metrics_table(conn)
@@ -1332,6 +1422,8 @@ Exit codes:
                     print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
                     print("-" * 80)
 
+                    # Acquire global vacuum slot before executing
+                    slot = acquire_vacuum_slot(conn, workers, table)
                     try:
                         duration = vacuum_table(conn, table, args.statement_timeout)
                         total_duration += duration
@@ -1350,6 +1442,8 @@ Exit codes:
                     except Exception as e:
                         print(f"           FAILED: {e}")
                         failed_tables.append((table, str(e)))
+                    finally:
+                        release_vacuum_slot(conn, slot)
             except KeyboardInterrupt:
                 print(f"\n\nInterrupted — completed {i - 1}/{len(tables)} tables in {total_duration:.1f}s")
                 return 1
@@ -1414,17 +1508,22 @@ Exit codes:
                                     print(f"           {activity.source.capitalize()} vacuum already running (PID {activity.pid})")
                                 return None, None, activity
 
-                        with print_lock:
-                            print(f"\n[{index}/{len(tables)}] VACUUM ANALYZE VERBOSE {tbl}")
-                            print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
-                        duration = vacuum_table(wconn, tbl, args.statement_timeout)
-                        with print_lock:
-                            print(f"           [{tbl}] Completed in {duration:.1f}s")
-                        return duration, None, None
-                    except Exception as e:
-                        with print_lock:
-                            print(f"           [{tbl}] FAILED: {e}")
-                        return None, str(e), None
+                        # Acquire global vacuum slot before executing
+                        slot = acquire_vacuum_slot(wconn, workers, tbl, print_lock)
+                        try:
+                            with print_lock:
+                                print(f"\n[{index}/{len(tables)}] VACUUM ANALYZE VERBOSE {tbl}")
+                                print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
+                            duration = vacuum_table(wconn, tbl, args.statement_timeout)
+                            with print_lock:
+                                print(f"           [{tbl}] Completed in {duration:.1f}s")
+                            return duration, None, None
+                        except Exception as e:
+                            with print_lock:
+                                print(f"           [{tbl}] FAILED: {e}")
+                            return None, str(e), None
+                        finally:
+                            release_vacuum_slot(wconn, slot)
                     finally:
                         conn_pool.put(wconn)
 
