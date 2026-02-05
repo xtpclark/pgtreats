@@ -118,6 +118,9 @@ class Baseline:
         import re
         # Python < 3.11 needs +00:00 not +00; normalize short tz offsets
         ts = re.sub(r'([+-]\d{2})$', r'\1:00', self.timestamp)
+        # Python < 3.11 requires exactly 0, 3, or 6 fractional digits;
+        # PostgreSQL may return any number (e.g. .44841 = 5 digits). Pad to 6.
+        ts = re.sub(r'\.(\d{1,5})([+-])', lambda m: f'.{m.group(1):0<6}{m.group(2)}', ts)
         baseline_dt = datetime.fromisoformat(ts)
         now = datetime.now(timezone.utc)
         if baseline_dt.tzinfo is None:
