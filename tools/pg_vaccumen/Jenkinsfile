@@ -76,6 +76,11 @@ pipeline {
             defaultValue: '0',
             description: 'Statement timeout in seconds for vacuum operations (0 = no timeout)'
         )
+        string(
+            name: 'MAX_SIZE',
+            defaultValue: '',
+            description: 'Skip tables larger than this size in GB (leave empty for no limit)'
+        )
         booleanParam(
             name: 'EXECUTE',
             defaultValue: false,
@@ -143,6 +148,7 @@ pipeline {
                     echo "Critical at: ${params.CRITICAL_PCT}% of autovacuum_freeze_max_age"
                     echo "Max tables per run: ${params.LIMIT}"
                     echo "Statement timeout: ${params.STATEMENT_TIMEOUT ?: '0'}s"
+                    echo "Max table size: ${params.MAX_SIZE ?: '(no limit)'}"
                     echo "Execute mode: ${params.EXECUTE}"
                     echo "Force mode: ${params.FORCE}"
                     echo "Metrics to DB: ${params.METRICS_TO_DB}"
@@ -189,6 +195,7 @@ pipeline {
                     def forceFlag = params.FORCE ? '--force' : ''
                     def thresholdFlag = params.THRESHOLD?.trim() ? "--threshold '${params.THRESHOLD}'" : ''
                     def timeoutFlag = params.STATEMENT_TIMEOUT?.trim() && params.STATEMENT_TIMEOUT != '0' ? "--statement-timeout '${params.STATEMENT_TIMEOUT}'" : ''
+                    def maxSizeFlag = params.MAX_SIZE?.trim() ? "--max-size '${params.MAX_SIZE}'" : ''
                     def metricsFlag = params.METRICS_TO_DB ? '--metrics-to-db' : ''
                     def baselineFlag = params.BASELINE_TO_DB ? '--baseline-to-db' : ''
                     def saveBaselineFlag = params.SAVE_BASELINE ? '--save-baseline' : ''
@@ -205,6 +212,7 @@ pipeline {
                                 --limit '${params.LIMIT}' \\
                                 ${thresholdFlag} \\
                                 ${timeoutFlag} \\
+                                ${maxSizeFlag} \\
                                 ${credFlags} \\
                                 ${forceFlag} \\
                                 ${executeFlag} \\

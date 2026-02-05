@@ -78,13 +78,58 @@ The locking behavior is identical whether vacuum is triggered by autovacuum or r
 
 | Scenario | What happens |
 |----------|--------------|
-| Autovacuum is vacuuming table X, script tries to vacuum X | Script waits for autovacuum to finish, then vacuums |
+| Autovacuum is vacuuming table X, script tries to vacuum X | **Skipped** (default) — script detects the active worker and moves on |
 | Script is vacuuming table X, autovacuum wants table X | Autovacuum skips that table (yields to manual vacuum) |
 | Both want different tables | Both run concurrently, no conflict |
 
-PostgreSQL's autovacuum is designed to be polite—it yields to manual operations. If this script is vacuuming a table, autovacuum won't fight for it. Conversely, if autovacuum got there first, your manual vacuum simply waits its turn.
+By default, pg_vaccumen queries `pg_stat_activity` for autovacuum workers before vacuuming and **automatically skips** any table that autovacuum is already processing. This avoids wasting I/O by re-vacuuming a table that's already being handled. Skipped tables are reported in the summary.
 
-**Bottom line**: Running this script won't cause deadlocks or conflicts with autovacuum. At worst, you wait briefly for an in-progress autovacuum to finish on a specific table.
+Use `--no-skip-autovacuum` to disable this behavior and queue behind autovacuum instead (the old behavior).
+
+**Bottom line**: The script is autovacuum-aware by default. It won't waste time re-vacuuming tables that autovacuum is already handling.
+
+### Handling Large Tables and Active Autovacuum
+
+When a few monster tables dominate the vacuum queue, they can block smaller tables from getting vacuumed. For example:
+
+> 245 tables exceed the 50% threshold, but the top 2 are massive (2.7 TB and 16 TB). Autovacuum is already running on both. Without filtering, pg_vaccumen would queue behind autovacuum on those 2 tables and never reach the other 243.
+
+Two features solve this:
+
+| Feature | Flag | Default | Purpose |
+|---------|------|---------|---------|
+| Size filter | `--max-size <GB>` | No limit | Exclude tables larger than N GB from vacuum queue |
+| Autovacuum skip | (automatic) | On | Skip tables where autovacuum is already running |
+
+**When to use each:**
+
+| Scenario | Recommendation |
+|----------|----------------|
+| A few huge tables block the queue | `--max-size 500` to skip tables over 500 GB |
+| Autovacuum already handling the biggest tables | Let auto-skip handle it (default) |
+| Both huge tables and active autovacuum | Use both — `--max-size 500` filters the monsters, auto-skip handles the rest |
+| You want to vacuum everything, including monsters | `--no-skip-autovacuum` and omit `--max-size` |
+
+**Example:**
+
+```bash
+# Skip tables over 500 GB, let autovacuum handle the rest
+python pg_vaccumen.py --host ... --database mydb --execute --max-size 500 --limit 50
+```
+
+The dry-run output shows table sizes and marks tables where autovacuum is active:
+
+```
+Tables to vacuum (50 of 243 total exceeding threshold):
+  (2 table(s) excluded by --max-size 500.0 GB)
+----------------------------------------------------------------------------------------------------
+Table                                              Age     % of Max         Size               Note
+----------------------------------------------------------------------------------------------------
+asset_locations                             140,221,003         70%    85.3 GB [autovacuum running]
+work_orders                                 138,500,122         69%    42.1 GB
+inventory_items                             135,002,881         67%    28.7 GB
+...
+```
 
 ## Blockers: What Prevents Vacuum Progress
 
@@ -261,11 +306,11 @@ Requirements:
 
 ```bash
 # Dry-run (default) - shows what would be vacuumed
-python pg_vaccumen.py --host mydb.cluster-xxx.us-east-1.rds.amazonaws.com \
+python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
     --database mydb --db-username postgres --db-password secret
 
 # Execute vacuum
-python pg_vaccumen.py --host mydb.cluster-xxx.us-east-1.rds.amazonaws.com \
+python pg_vaccumen.py --host mydb.cluster-xxx.us-west-2.rds.amazonaws.com \
     --database mydb --db-username postgres --db-password secret --execute
 
 # Using AWS cluster lookup (requires IAM permissions)
@@ -281,7 +326,7 @@ python pg_vaccumen.py --cluster my-aurora-cluster --database mydb
 | `--cluster` | Aurora cluster identifier (uses boto3 to lookup endpoint) |
 | `--host` | Database host (bypasses AWS lookup) |
 | `--database` | Database name (required) |
-| `--region` | AWS region (default: us-east-1) |
+| `--region` | AWS region (default: us-west-2) |
 | `--db-username` | Database username (default: postgres) |
 | `--db-password` | Database password (required with --host, otherwise uses Secrets Manager) |
 
@@ -293,6 +338,8 @@ python pg_vaccumen.py --cluster my-aurora-cluster --database mydb
 | `--warning-pct` | 80 | Alert warning when oldest table exceeds this % of max |
 | `--critical-pct` | 95 | Alert critical when oldest table exceeds this % of max |
 | `--limit` | 10 | Maximum tables to vacuum per run |
+| `--max-size` | No limit | Skip tables larger than this size in GB |
+| `--no-skip-autovacuum` | Skip enabled | Don't skip tables currently being vacuumed by autovacuum |
 
 ### Execution Options
 
@@ -551,6 +598,9 @@ RECOMMENDATIONS
 | Hitting `--limit` with large backlog | Increase `--limit` (try 2-3x) |
 | >30 days headroom, no tables to vacuum | Reduce frequency or raise `--threshold` |
 | Blockers detected | Investigate long-running transactions or lagging replication slots |
+| A few huge tables dominate the queue | Use `--max-size` to skip them, let autovacuum handle |
+| Many tables skipped (autovacuum running) | Autovacuum is keeping up — focus `--limit` on remaining tables |
+| Tables excluded by size need vacuuming | Run a separate job without `--max-size` during a longer window |
 
 ## Jenkins Integration
 
@@ -570,6 +620,7 @@ The included `Jenkinsfile` provides a parameterized pipeline for nightly runs.
 | `WARNING_PCT` | 80 | Warning alert percentage |
 | `CRITICAL_PCT` | 95 | Critical alert percentage |
 | `LIMIT` | 10 | Max tables per run |
+| `MAX_SIZE` | | Skip tables larger than this size in GB (empty = no limit) |
 | `EXECUTE` | false | Actually vacuum (false = dry-run) |
 | `FORCE` | false | Proceed despite blockers |
 | `METRICS_TO_DB` | true | Store metrics in database |

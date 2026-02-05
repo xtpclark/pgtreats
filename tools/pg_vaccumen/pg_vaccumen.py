@@ -447,36 +447,71 @@ def get_tables_to_vacuum(
     conn: psycopg.Connection,
     threshold: int,
     limit: int,
-) -> tuple[list[tuple[str, int]], int]:
+    max_size_bytes: int | None = None,
+) -> tuple[list[tuple[str, int, int]], int, int]:
     """Query tables with relfrozenxid age exceeding threshold.
 
+    Args:
+        conn: Database connection.
+        threshold: Minimum relfrozenxid age to select a table.
+        limit: Maximum number of tables to return.
+        max_size_bytes: If set, exclude tables larger than this (bytes).
+
     Returns:
-        Tuple of (limited list of tables, total count of tables exceeding threshold)
+        Tuple of (limited list of (table, age, size_bytes),
+                  total count exceeding threshold,
+                  count excluded by size filter).
     """
-    # Get total count first
-    count_query = """
+    size_filter = ""
+    params_count: list = [threshold]
+    params_query: list = [threshold]
+
+    if max_size_bytes is not None:
+        size_filter = " and pg_total_relation_size(oid) <= %s"
+        params_count.append(max_size_bytes)
+        params_query.append(max_size_bytes)
+
+    # Get total count (with size filter applied)
+    count_query = f"""
+        select count(*)
+        from pg_class
+        where relkind in ('r', 't')
+          and age(relfrozenxid) > %s
+          {size_filter}
+    """
+    # Get total count without size filter (to calculate excluded)
+    count_all_query = """
         select count(*)
         from pg_class
         where relkind in ('r', 't')
           and age(relfrozenxid) > %s
     """
-    # Get limited results
-    query = """
-        select oid::regclass::text, age(relfrozenxid)
+    # Get limited results (with size filter)
+    query = f"""
+        select oid::regclass::text, age(relfrozenxid),
+               pg_total_relation_size(oid)
         from pg_class
         where relkind in ('r', 't')
           and age(relfrozenxid) > %s
+          {size_filter}
         order by age(relfrozenxid) desc
         limit %s
     """
+    params_query.append(limit)
+
     with conn.cursor() as cur:
-        cur.execute(count_query, (threshold,))
+        cur.execute(count_all_query, (threshold,))
+        total_all = cur.fetchone()[0]
+
+        cur.execute(count_query, params_count)
         total_count = cur.fetchone()[0]
 
-        cur.execute(query, (threshold, limit))
+        size_excluded = total_all - total_count
+
+        cur.execute(query, params_query)
         tables = cur.fetchall()
 
-        return tables, total_count
+        return tables, total_count, size_excluded
 
 
 @dataclass
@@ -489,6 +524,37 @@ class VacuumMetric:
     duration_seconds: float
     database: str
     host: str
+
+
+def get_autovacuum_tables(conn: psycopg.Connection) -> dict[str, int]:
+    """Query pg_stat_activity for tables currently being vacuumed by autovacuum.
+
+    Returns:
+        Dict mapping schema-qualified table name to autovacuum worker PID.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            select query, pid
+            from pg_stat_activity
+            where backend_type = 'autovacuum worker'
+              and query like 'autovacuum:%%'
+        """)
+        result = {}
+        for query_text, pid in cur.fetchall():
+            # Format: "autovacuum: VACUUM public.table_name"
+            # or:     "autovacuum: VACUUM public.table_name (to prevent wraparound)"
+            parts = query_text.split()
+            for i, part in enumerate(parts):
+                if part.upper() in ('VACUUM', 'ANALYZE') and i + 1 < len(parts):
+                    table_name = parts[i + 1]
+                    # Store both schema-qualified and bare name for matching
+                    # oid::regclass::text returns bare name for public schema
+                    result[table_name] = pid
+                    if '.' in table_name:
+                        bare_name = table_name.split('.', 1)[1]
+                        result[bare_name] = pid
+                    break
+        return result
 
 
 def get_table_size(conn: psycopg.Connection, table: str) -> int:
@@ -644,7 +710,7 @@ Exit codes:
     parser.add_argument("--cluster", help="Aurora cluster identifier (required unless --host specified)")
     parser.add_argument("--host", help="Database host (bypasses AWS cluster lookup)")
     parser.add_argument("--database", required=True, help="Database name")
-    parser.add_argument("--region", default="us-east-1", help="AWS region")
+    parser.add_argument("--region", default="us-west-2", help="AWS region")
     parser.add_argument("--db-username", default="postgres", help="Database username")
     parser.add_argument("--db-password", help="Database password (required when using --host)")
     parser.add_argument("--limit", type=int, default=10, help="Max tables to vacuum per run")
@@ -670,6 +736,17 @@ Exit codes:
         type=int,
         default=DEFAULT_CRITICAL_PCT,
         help=f"Alert critical at this %% of autovacuum_freeze_max_age (default: {DEFAULT_CRITICAL_PCT}%%)",
+    )
+    parser.add_argument(
+        "--max-size",
+        type=float,
+        default=None,
+        help="Skip tables larger than this size in GB (default: no limit)",
+    )
+    parser.add_argument(
+        "--no-skip-autovacuum",
+        action="store_true",
+        help="Don't skip tables currently being vacuumed by autovacuum (default: skip them)",
     )
     parser.add_argument(
         "--execute",
@@ -801,6 +878,10 @@ Exit codes:
         print(f"Warning at: {args.warning_pct}% ({int(preflight.autovacuum_freeze_max_age * args.warning_pct / 100):,})")
         print(f"Critical at: {args.critical_pct}% ({int(preflight.autovacuum_freeze_max_age * args.critical_pct / 100):,})")
         print(f"Max tables per run: {args.limit}")
+        if args.max_size is not None:
+            print(f"Max table size: {args.max_size} GB")
+        if not args.no_skip_autovacuum:
+            print(f"Skip autovacuum targets: yes")
         print()
 
         if not args.skip_preflight:
@@ -827,10 +908,19 @@ Exit codes:
         print()
 
         # Get tables to vacuum
-        tables, total_count = get_tables_to_vacuum(conn, threshold, args.limit)
+        max_size_bytes = int(args.max_size * 1024 * 1024 * 1024) if args.max_size is not None else None
+        tables, total_count, size_excluded = get_tables_to_vacuum(
+            conn, threshold, args.limit, max_size_bytes
+        )
+
+        # Get autovacuum worker info for annotation
+        skip_autovacuum = not args.no_skip_autovacuum
+        autovac_tables = get_autovacuum_tables(conn) if skip_autovacuum else {}
 
         if not tables:
             print(f"No tables exceed threshold ({threshold:,})")
+            if size_excluded > 0:
+                print(f"  ({size_excluded} table(s) excluded by --max-size {args.max_size} GB)")
             print("Proactive maintenance is keeping up with transaction load.")
 
             # Still show recommendations even with no tables
@@ -851,13 +941,21 @@ Exit codes:
             print(f"Tables to vacuum ({len(tables)} of {total_count} total exceeding threshold):")
         else:
             print(f"Tables to vacuum ({len(tables)}):")
-        print("-" * 80)
-        print(f"{'Table':<45} {'Age':>15} {'% of Max':>12}")
-        print("-" * 80)
-        for table, age in tables:
+        if size_excluded > 0:
+            print(f"  ({size_excluded} table(s) excluded by --max-size {args.max_size} GB)")
+        print("-" * 100)
+        print(f"{'Table':<40} {'Age':>15} {'% of Max':>10} {'Size':>12} {'Note':>18}")
+        print("-" * 100)
+        for table, age, size_bytes in tables:
             pct = age * 100 // preflight.autovacuum_freeze_max_age
-            print(f"{table:<45} {age:>15,} {pct:>11}%")
-        print("-" * 80)
+            size_gb = size_bytes / (1024 * 1024 * 1024)
+            if size_gb >= 1.0:
+                size_str = f"{size_gb:.1f} GB"
+            else:
+                size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+            note = "[autovacuum running]" if table in autovac_tables else ""
+            print(f"{table:<40} {age:>15,} {pct:>9}% {size_str:>12} {note}")
+        print("-" * 100)
         if total_count > len(tables):
             print(f"  ... and {total_count - len(tables)} more table(s) waiting")
         print()
@@ -880,6 +978,10 @@ Exit codes:
         if args.metrics_to_db:
             ensure_metrics_table(conn)
 
+        # Re-check autovacuum workers right before execution
+        if skip_autovacuum:
+            autovac_tables = get_autovacuum_tables(conn)
+
         print("Executing vacuum...")
         print("=" * 80)
         metrics: list[VacuumMetric] = []
@@ -887,11 +989,19 @@ Exit codes:
         collect_metrics = args.metrics_file or args.metrics_to_db
 
         failed_tables: list[tuple[str, str]] = []
+        skipped_tables: list[tuple[str, int]] = []  # (table, autovacuum_pid)
 
-        for i, (table, age) in enumerate(tables, 1):
+        for i, (table, age, size_bytes) in enumerate(tables, 1):
             pct = age * 100 // preflight.autovacuum_freeze_max_age
-            size_bytes = get_table_size(conn, table)
             size_mb = size_bytes / (1024 * 1024)
+
+            # Skip tables currently being vacuumed by autovacuum
+            if skip_autovacuum and table in autovac_tables:
+                pid = autovac_tables[table]
+                print(f"\n[{i}/{len(tables)}] SKIP {table}")
+                print(f"           Autovacuum already running (PID {pid})")
+                skipped_tables.append((table, pid))
+                continue
 
             print(f"\n[{i}/{len(tables)}] VACUUM ANALYZE VERBOSE {table}")
             print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
@@ -918,8 +1028,14 @@ Exit codes:
 
         print()
         print("=" * 80)
-        successful = len(tables) - len(failed_tables)
-        print(f"Vacuum complete: {successful}/{len(tables)} tables in {total_duration:.1f}s")
+        vacuumed = len(tables) - len(failed_tables) - len(skipped_tables)
+        print(f"Vacuum complete: {vacuumed}/{len(tables)} tables in {total_duration:.1f}s")
+
+        if skipped_tables:
+            print()
+            print(f"SKIPPED (autovacuum running): {len(skipped_tables)}")
+            for table, pid in skipped_tables:
+                print(f"  - {table} (PID {pid})")
 
         if failed_tables:
             print()
