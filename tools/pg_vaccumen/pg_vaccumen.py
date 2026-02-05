@@ -714,6 +714,42 @@ def get_vacuum_activity(conn: psycopg.Connection) -> dict[str, VacuumActivity]:
     return result
 
 
+def is_table_being_vacuumed(conn: psycopg.Connection, table: str) -> VacuumActivity | None:
+    """Check if a specific table is currently being vacuumed.
+
+    Lightweight per-table check against pg_stat_activity.  Used inside the
+    vacuum loop so we detect vacuums started by *other* sessions (e.g. a
+    second pg_vaccumen instance) after our initial snapshot.
+
+    Returns:
+        VacuumActivity if the table is being vacuumed, None otherwise.
+    """
+    bare = table.split('.', 1)[1] if '.' in table else table
+    with conn.cursor() as cur:
+        # Autovacuum workers
+        cur.execute("""
+            select pid from pg_stat_activity
+            where backend_type = 'autovacuum worker'
+              and query like %s
+        """, (f'%{bare}%',))
+        row = cur.fetchone()
+        if row:
+            return VacuumActivity(pid=row[0], source="autovacuum")
+
+        # Manual VACUUM from other sessions
+        cur.execute("""
+            select pid from pg_stat_activity
+            where pid != pg_backend_pid()
+              and query ilike %s
+              and backend_type = 'client backend'
+        """, (f'vacuum%{bare}%',))
+        row = cur.fetchone()
+        if row:
+            return VacuumActivity(pid=row[0], source="manual")
+
+    return None
+
+
 MAX_WORKERS = 8  # Hard cap regardless of what user requests
 
 
@@ -1282,12 +1318,15 @@ Exit codes:
                     pct = age * 100 // preflight.autovacuum_freeze_max_age
                     size_mb = size_bytes / (1024 * 1024)
 
-                    if skip_autovacuum and table in vacuum_activity:
-                        activity = vacuum_activity[table]
-                        print(f"\n[{i}/{len(tables)}] SKIP {table}")
-                        print(f"           {activity.source.capitalize()} vacuum already running (PID {activity.pid})")
-                        skipped_tables.append((table, activity.pid, activity.source))
-                        continue
+                    # Live check: skip if another session started vacuuming
+                    # this table since our initial snapshot
+                    if skip_autovacuum:
+                        activity = is_table_being_vacuumed(conn, table)
+                        if activity:
+                            print(f"\n[{i}/{len(tables)}] SKIP {table}")
+                            print(f"           {activity.source.capitalize()} vacuum already running (PID {activity.pid})")
+                            skipped_tables.append((table, activity.pid, activity.source))
+                            continue
 
                     print(f"\n[{i}/{len(tables)}] VACUUM ANALYZE VERBOSE {table}")
                     print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
@@ -1359,22 +1398,33 @@ Exit codes:
 
                 def _vacuum_one(
                     tbl: str, age: int, size_bytes: int, index: int,
-                ) -> tuple[float | None, str | None]:
+                ) -> tuple[float | None, str | None, VacuumActivity | None]:
+                    """Returns (duration, error, skipped_activity)."""
                     pct = age * 100 // preflight.autovacuum_freeze_max_age
                     size_mb = size_bytes / (1024 * 1024)
                     wconn = conn_pool.get()
                     try:
+                        # Live check: another session may have started
+                        # vacuuming this table since we built the work list
+                        if skip_autovacuum:
+                            activity = is_table_being_vacuumed(wconn, tbl)
+                            if activity:
+                                with print_lock:
+                                    print(f"\n[{index}/{len(tables)}] SKIP {tbl}")
+                                    print(f"           {activity.source.capitalize()} vacuum already running (PID {activity.pid})")
+                                return None, None, activity
+
                         with print_lock:
                             print(f"\n[{index}/{len(tables)}] VACUUM ANALYZE VERBOSE {tbl}")
                             print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
                         duration = vacuum_table(wconn, tbl, args.statement_timeout)
                         with print_lock:
                             print(f"           [{tbl}] Completed in {duration:.1f}s")
-                        return duration, None
+                        return duration, None, None
                     except Exception as e:
                         with print_lock:
                             print(f"           [{tbl}] FAILED: {e}")
-                        return None, str(e)
+                        return None, str(e), None
                     finally:
                         conn_pool.put(wconn)
 
@@ -1387,8 +1437,10 @@ Exit codes:
 
                         for future in as_completed(futures):
                             tbl, age, sz = futures[future]
-                            duration, error = future.result()
-                            if error:
+                            duration, error, skipped = future.result()
+                            if skipped:
+                                skipped_tables.append((tbl, skipped.pid, skipped.source))
+                            elif error:
                                 failed_tables.append((tbl, error))
                             else:
                                 total_duration += duration
