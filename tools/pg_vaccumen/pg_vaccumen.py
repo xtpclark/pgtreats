@@ -1277,39 +1277,43 @@ Exit codes:
             print("Executing vacuum...")
             print("=" * 80)
 
-            for i, (table, age, size_bytes) in enumerate(tables, 1):
-                pct = age * 100 // preflight.autovacuum_freeze_max_age
-                size_mb = size_bytes / (1024 * 1024)
+            try:
+                for i, (table, age, size_bytes) in enumerate(tables, 1):
+                    pct = age * 100 // preflight.autovacuum_freeze_max_age
+                    size_mb = size_bytes / (1024 * 1024)
 
-                if skip_autovacuum and table in vacuum_activity:
-                    activity = vacuum_activity[table]
-                    print(f"\n[{i}/{len(tables)}] SKIP {table}")
-                    print(f"           {activity.source.capitalize()} vacuum already running (PID {activity.pid})")
-                    skipped_tables.append((table, activity.pid, activity.source))
-                    continue
+                    if skip_autovacuum and table in vacuum_activity:
+                        activity = vacuum_activity[table]
+                        print(f"\n[{i}/{len(tables)}] SKIP {table}")
+                        print(f"           {activity.source.capitalize()} vacuum already running (PID {activity.pid})")
+                        skipped_tables.append((table, activity.pid, activity.source))
+                        continue
 
-                print(f"\n[{i}/{len(tables)}] VACUUM ANALYZE VERBOSE {table}")
-                print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
-                print("-" * 80)
+                    print(f"\n[{i}/{len(tables)}] VACUUM ANALYZE VERBOSE {table}")
+                    print(f"           (age={age:,}, {pct}% of max, {size_mb:.1f} MB)")
+                    print("-" * 80)
 
-                try:
-                    duration = vacuum_table(conn, table, args.statement_timeout)
-                    total_duration += duration
-                    print(f"           Completed in {duration:.1f}s")
+                    try:
+                        duration = vacuum_table(conn, table, args.statement_timeout)
+                        total_duration += duration
+                        print(f"           Completed in {duration:.1f}s")
 
-                    if collect_metrics:
-                        metrics.append(VacuumMetric(
-                            timestamp=datetime.now().isoformat(),
-                            table=table,
-                            age_before=age,
-                            size_bytes=size_bytes,
-                            duration_seconds=round(duration, 2),
-                            database=args.database,
-                            host=endpoint,
-                        ))
-                except Exception as e:
-                    print(f"           FAILED: {e}")
-                    failed_tables.append((table, str(e)))
+                        if collect_metrics:
+                            metrics.append(VacuumMetric(
+                                timestamp=datetime.now().isoformat(),
+                                table=table,
+                                age_before=age,
+                                size_bytes=size_bytes,
+                                duration_seconds=round(duration, 2),
+                                database=args.database,
+                                host=endpoint,
+                            ))
+                    except Exception as e:
+                        print(f"           FAILED: {e}")
+                        failed_tables.append((table, str(e)))
+            except KeyboardInterrupt:
+                print(f"\n\nInterrupted — completed {i - 1}/{len(tables)} tables in {total_duration:.1f}s")
+                return 1
 
         else:
             # --- Parallel execution (multiple workers) ---
