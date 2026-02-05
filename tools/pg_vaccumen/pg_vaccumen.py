@@ -1374,33 +1374,43 @@ Exit codes:
                     finally:
                         conn_pool.put(wconn)
 
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {
-                        executor.submit(_vacuum_one, tbl, age, sz, idx): (tbl, age, sz)
-                        for idx, tbl, age, sz in tables_to_run
-                    }
+                try:
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {
+                            executor.submit(_vacuum_one, tbl, age, sz, idx): (tbl, age, sz)
+                            for idx, tbl, age, sz in tables_to_run
+                        }
 
-                    for future in as_completed(futures):
-                        tbl, age, sz = futures[future]
-                        duration, error = future.result()
-                        if error:
-                            failed_tables.append((tbl, error))
-                        else:
-                            total_duration += duration
-                            if collect_metrics:
-                                metrics.append(VacuumMetric(
-                                    timestamp=datetime.now().isoformat(),
-                                    table=tbl,
-                                    age_before=age,
-                                    size_bytes=sz,
-                                    duration_seconds=round(duration, 2),
-                                    database=args.database,
-                                    host=endpoint,
-                                ))
-
-                # Close worker connections
-                for wc in worker_conns:
-                    wc.close()
+                        for future in as_completed(futures):
+                            tbl, age, sz = futures[future]
+                            duration, error = future.result()
+                            if error:
+                                failed_tables.append((tbl, error))
+                            else:
+                                total_duration += duration
+                                if collect_metrics:
+                                    metrics.append(VacuumMetric(
+                                        timestamp=datetime.now().isoformat(),
+                                        table=tbl,
+                                        age_before=age,
+                                        size_bytes=sz,
+                                        duration_seconds=round(duration, 2),
+                                        database=args.database,
+                                        host=endpoint,
+                                    ))
+                except KeyboardInterrupt:
+                    print("\n\nInterrupted — canceling in-flight vacuums...")
+                    for f in futures:
+                        f.cancel()
+                    for wc in worker_conns:
+                        wc.close()
+                    print("Worker connections closed. In-flight vacuums canceled.")
+                    return 1
+                finally:
+                    # Close worker connections (normal exit path)
+                    for wc in worker_conns:
+                        if not wc.closed:
+                            wc.close()
 
         # --- Summary (shared by both paths) ---
         print()
