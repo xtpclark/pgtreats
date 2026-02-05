@@ -590,6 +590,114 @@ RECOMMENDATIONS
   • Backlog: 234 additional table(s) waiting beyond --limit of 10. Total needing vacuum: 244. Consider --limit 30.
 ```
 
+## Real-World Scenario: Catching Up on a 245-Table Backlog
+
+This walkthrough shows how to triage a production database where proactive vacuum has never run and most tables are well past the 50% threshold.
+
+### Initial assessment
+
+A production Aurora PostgreSQL database with `autovacuum_freeze_max_age` at 200M. First dry-run at default 50% threshold:
+
+```
+Alert Status: OK: Oldest XID age at 79% of autovacuum threshold (158,859,691 / 200,000,000)
+
+Tables to vacuum (2):
+  (2 table(s) excluded by --max-size 500.0 GB)
+----------------------------------------------------------------------------------------------------
+Table                                                Age   % of Max         Size               Note
+----------------------------------------------------------------------------------------------------
+event_log                                    158,859,694        79%    2680.1 GB [autovacuum running]
+message_archive                              158,839,100        79%   16183.8 GB [autovacuum running]
+----------------------------------------------------------------------------------------------------
+```
+
+Only 2 tables above 50%, both are massive (2.7 TB and 16 TB), and autovacuum is already running on both. With `--max-size 500` and auto-skip, both are filtered out — nothing to do at this threshold.
+
+### Step 1: Lower the threshold to find the backlog
+
+Drop to 25% (50M) to see what's waiting below the default threshold:
+
+```bash
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 500 --force --limit 30 --threshold 50000000
+```
+
+```
+Tables to vacuum (30 of 139 total exceeding threshold):
+  (5 table(s) excluded by --max-size 500.0 GB)
+----------------------------------------------------------------------------------------------------
+Table                                                Age   % of Max         Size               Note
+----------------------------------------------------------------------------------------------------
+status_key_values                             58,738,271        29%     118.9 GB
+elogs.event_transaction_assignments           57,922,905        28%      64.0 MB
+state_cache                                   57,824,644        28%       1.0 GB
+enclosing_geofences                           56,873,134        28%       1.6 GB
+sensor_statuses                               54,099,678        27%       5.0 MB
+elogs.driver_status                           51,896,819        25%      52.4 MB
+elogs.events                                  50,986,818        25%      55.4 GB
+elogs.raw_events                              50,986,272        25%      50.0 GB
+driver_change_history                         50,985,726        25%      48.5 GB
+command_audit                                 50,985,230        25%     307.0 GB
+hourly_incident_counts                        50,985,000        25%     498.0 GB
+...
+----------------------------------------------------------------------------------------------------
+  ... and 109 more table(s) waiting
+
+RECOMMENDATIONS
+  • Backlog: 109 additional table(s) waiting beyond --limit of 30. Total needing vacuum: 139.
+    Consider --limit 90.
+```
+
+139 tables between 25-29% of the 200M threshold. Sizes range from 5 MB to 498 GB.
+
+### Step 2: Vacuum the small tables first
+
+Start with smaller tables to make quick progress on the backlog:
+
+```bash
+# Vacuum tables under 100 GB, up to 50 per run
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 100 --force --limit 50 --threshold 50000000 --execute \
+    --metrics-to-db --baseline-to-db
+```
+
+This knocks out dozens of small tables quickly while skipping the 100+ GB tables that would take hours each.
+
+### Step 3: Increase size limit for bigger tables
+
+Once the small tables are done, raise the size limit:
+
+```bash
+# Now vacuum tables up to 500 GB
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 500 --force --limit 10 --threshold 50000000 --execute \
+    --metrics-to-db --baseline-to-db
+```
+
+Fewer tables per run (`--limit 10`) since each one is larger and takes longer.
+
+### Step 4: Return to normal nightly schedule
+
+Once the backlog is cleared, return to the default 50% threshold for nightly runs:
+
+```bash
+# Nightly cron / Jenkins job
+python pg_vaccumen.py --host ... --database mydb \
+    --max-size 500 --limit 30 --execute \
+    --metrics-to-db --baseline-to-db
+```
+
+### Key takeaways
+
+| Lesson | Detail |
+|--------|--------|
+| Start with dry-run | Always verify what will be vacuumed before adding `--execute` |
+| Lower threshold to find backlog | Default 50% may miss tables that need proactive attention |
+| Use `--max-size` to prioritize | Vacuum many small tables quickly before tackling large ones |
+| Auto-skip prevents wasted I/O | Don't re-vacuum what autovacuum is already handling |
+| Increase `--limit` for backlogs | The recommendation engine tells you when to increase it |
+| Work in phases | Small tables first, then medium, then large — each in separate runs if needed |
+
 ## Tuning Guidance
 
 | Symptom | Action |
