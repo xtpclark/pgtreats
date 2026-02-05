@@ -1,0 +1,263 @@
+/**
+ * Proactive Vacuum Maintenance for Aurora PostgreSQL 17
+ *
+ * Vacuums tables BEFORE they hit autovacuum_freeze_max_age, spreading
+ * work over nightly runs to create a steady plateau instead of
+ * emergency autovacuum spikes.
+ *
+ * Thresholds are percentages of autovacuum_freeze_max_age (read from DB):
+ *   - Table selection: 50% (default) - vacuum tables at this age or higher
+ *   - Warning: 80% - oldest table approaching autovacuum trigger
+ *   - Critical: 95% - oldest table at or past autovacuum trigger
+ *
+ * Exit codes:
+ *   0 - Success / OK
+ *   1 - Error (connection failure, blockers without --force)
+ *   2 - Warning threshold exceeded
+ *   3 - Critical threshold exceeded
+ */
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'CLUSTER',
+            defaultValue: '',
+            description: 'Aurora cluster identifier (uses boto3 to lookup endpoint). Either CLUSTER or HOST required.'
+        )
+        string(
+            name: 'HOST',
+            defaultValue: '',
+            description: 'Database host (bypasses AWS lookup). Either CLUSTER or HOST required.'
+        )
+        string(
+            name: 'DATABASE',
+            defaultValue: 'my_database',
+            description: 'Database name'
+        )
+        string(
+            name: 'REGION',
+            defaultValue: 'us-east-1',
+            description: 'AWS region (only used with CLUSTER)'
+        )
+        string(
+            name: 'DB_USERNAME',
+            defaultValue: 'postgres',
+            description: 'Database username'
+        )
+        password(
+            name: 'DB_PASSWORD',
+            defaultValue: '',
+            description: 'Database password (required with HOST, optional with CLUSTER if using Secrets Manager)'
+        )
+        string(
+            name: 'THRESHOLD',
+            defaultValue: '',
+            description: 'relfrozenxid age threshold for table selection (leave empty for 50% of autovacuum_freeze_max_age)'
+        )
+        string(
+            name: 'WARNING_PCT',
+            defaultValue: '80',
+            description: 'Alert warning at this % of autovacuum_freeze_max_age'
+        )
+        string(
+            name: 'CRITICAL_PCT',
+            defaultValue: '95',
+            description: 'Alert critical at this % of autovacuum_freeze_max_age'
+        )
+        string(
+            name: 'LIMIT',
+            defaultValue: '10',
+            description: 'Maximum number of tables to vacuum per run'
+        )
+        string(
+            name: 'STATEMENT_TIMEOUT',
+            defaultValue: '0',
+            description: 'Statement timeout in seconds for vacuum operations (0 = no timeout)'
+        )
+        booleanParam(
+            name: 'EXECUTE',
+            defaultValue: false,
+            description: 'Execute vacuum (false = dry-run mode)'
+        )
+        booleanParam(
+            name: 'FORCE',
+            defaultValue: false,
+            description: 'Proceed even if blockers are detected (long txns, replication slots, prepared txns)'
+        )
+        booleanParam(
+            name: 'METRICS_TO_DB',
+            defaultValue: true,
+            description: 'Store vacuum metrics in vacuum_metrics table'
+        )
+        booleanParam(
+            name: 'BASELINE_TO_DB',
+            defaultValue: true,
+            description: 'Store/load transaction baseline from vacuum_baseline table'
+        )
+        booleanParam(
+            name: 'SAVE_BASELINE',
+            defaultValue: false,
+            description: 'Save current stats as new baseline (first run or after stats reset)'
+        )
+    }
+
+    environment {
+        PYTHON_CMD = 'python3'
+    }
+
+    stages {
+        stage('Setup Dependencies') {
+            steps {
+                script {
+                    echo "=== Checking Python and Dependencies ==="
+                    sh "${PYTHON_CMD} --version"
+
+                    def depsOk = sh(
+                        script: "${PYTHON_CMD} -c \"import boto3, psycopg\" 2>/dev/null",
+                        returnStatus: true
+                    ) == 0
+
+                    if (depsOk) {
+                        echo "All dependencies already installed"
+                    } else {
+                        echo "Installing missing dependencies..."
+                        sh "${PYTHON_CMD} -m pip install --user --quiet boto3 'psycopg[binary]'"
+                        sh "${PYTHON_CMD} -c \"import boto3, psycopg; print('Dependencies installed successfully')\""
+                    }
+                }
+            }
+        }
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo "=== Proactive Vacuum Maintenance ==="
+                    echo "Cluster: ${params.CLUSTER ?: '(not set)'}"
+                    echo "Host: ${params.HOST ?: '(not set)'}"
+                    echo "Database: ${params.DATABASE}"
+                    echo "Region: ${params.REGION}"
+                    echo "Table selection threshold: ${params.THRESHOLD ?: '50% of autovacuum_freeze_max_age'}"
+                    echo "Warning at: ${params.WARNING_PCT}% of autovacuum_freeze_max_age"
+                    echo "Critical at: ${params.CRITICAL_PCT}% of autovacuum_freeze_max_age"
+                    echo "Max tables per run: ${params.LIMIT}"
+                    echo "Statement timeout: ${params.STATEMENT_TIMEOUT ?: '0'}s"
+                    echo "Execute mode: ${params.EXECUTE}"
+                    echo "Force mode: ${params.FORCE}"
+                    echo "Metrics to DB: ${params.METRICS_TO_DB}"
+                    echo "Baseline to DB: ${params.BASELINE_TO_DB}"
+                    echo "Save baseline: ${params.SAVE_BASELINE}"
+
+                    if (!params.CLUSTER?.trim() && !params.HOST?.trim()) {
+                        error "Either CLUSTER or HOST parameter is required"
+                    }
+
+                    if (params.HOST?.trim() && !params.DB_PASSWORD?.toString()?.trim()) {
+                        error "DB_PASSWORD is required when using HOST"
+                    }
+
+                    def dbPass = params.DB_PASSWORD?.toString() ?: ''
+                    if (dbPass.trim()) {
+                        writeFile file: "${WORKSPACE}/.db_password", text: dbPass
+                        sh "chmod 600 ${WORKSPACE}/.db_password"
+                    }
+                }
+            }
+        }
+
+        stage('Run Vacuum') {
+            steps {
+                script {
+                    // Build connection flags
+                    def connectionFlags = ''
+                    if (params.HOST?.trim()) {
+                        connectionFlags = "--host '${params.HOST}'"
+                    } else {
+                        connectionFlags = "--cluster '${params.CLUSTER}' --region '${params.REGION}'"
+                    }
+
+                    // Build credential flags
+                    def credFlags = "--db-username '${params.DB_USERNAME}'"
+                    def dbPass = params.DB_PASSWORD?.toString() ?: ''
+                    if (dbPass.trim()) {
+                        credFlags += ' --db-password "$(cat ${WORKSPACE}/.db_password)"'
+                    }
+
+                    // Build optional flags
+                    def executeFlag = params.EXECUTE ? '--execute' : ''
+                    def forceFlag = params.FORCE ? '--force' : ''
+                    def thresholdFlag = params.THRESHOLD?.trim() ? "--threshold '${params.THRESHOLD}'" : ''
+                    def timeoutFlag = params.STATEMENT_TIMEOUT?.trim() && params.STATEMENT_TIMEOUT != '0' ? "--statement-timeout '${params.STATEMENT_TIMEOUT}'" : ''
+                    def metricsFlag = params.METRICS_TO_DB ? '--metrics-to-db' : ''
+                    def baselineFlag = params.BASELINE_TO_DB ? '--baseline-to-db' : ''
+                    def saveBaselineFlag = params.SAVE_BASELINE ? '--save-baseline' : ''
+
+                    echo "=== Running Proactive Vacuum Maintenance ==="
+
+                    def exitCode = sh(
+                        script: """
+                            ${PYTHON_CMD} ${WORKSPACE}/pg_vaccumen.py \\
+                                ${connectionFlags} \\
+                                --database '${params.DATABASE}' \\
+                                --warning-pct '${params.WARNING_PCT}' \\
+                                --critical-pct '${params.CRITICAL_PCT}' \\
+                                --limit '${params.LIMIT}' \\
+                                ${thresholdFlag} \\
+                                ${timeoutFlag} \\
+                                ${credFlags} \\
+                                ${forceFlag} \\
+                                ${executeFlag} \\
+                                ${metricsFlag} \\
+                                ${baselineFlag} \\
+                                ${saveBaselineFlag}
+                        """,
+                        returnStatus: true
+                    )
+
+                    // Handle exit codes
+                    switch (exitCode) {
+                        case 0:
+                            echo "=== Vacuum completed successfully (OK) ==="
+                            break
+                        case 1:
+                            error "Vacuum failed with error (blockers detected or connection failure)"
+                            break
+                        case 2:
+                            unstable "WARNING: Tables approaching autovacuum threshold"
+                            break
+                        case 3:
+                            unstable "CRITICAL: Tables at or past autovacuum threshold"
+                            currentBuild.result = 'FAILURE'
+                            break
+                        default:
+                            error "Vacuum failed with unexpected exit code: ${exitCode}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "=== Pipeline completed successfully ==="
+        }
+        unstable {
+            echo "=== Pipeline completed with warnings - tables approaching autovacuum threshold ==="
+        }
+        failure {
+            echo "=== Pipeline failed - check logs above ==="
+        }
+        always {
+            script {
+                try {
+                    if (env.WORKSPACE) {
+                        sh "rm -f ${env.WORKSPACE}/.db_password || true"
+                    }
+                } catch (Exception e) {
+                    echo "Cleanup skipped: ${e.message}"
+                }
+            }
+        }
+    }
+}
