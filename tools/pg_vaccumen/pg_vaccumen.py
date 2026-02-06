@@ -1489,11 +1489,14 @@ Exit codes:
                     conn_pool.put(wc)
 
                 print_lock = threading.Lock()
+                interrupted = threading.Event()
 
                 def _vacuum_one(
                     tbl: str, age: int, size_bytes: int, index: int,
                 ) -> tuple[float | None, str | None, VacuumActivity | None]:
                     """Returns (duration, error, skipped_activity)."""
+                    if interrupted.is_set():
+                        return None, None, None
                     pct = age * 100 // preflight.autovacuum_freeze_max_age
                     size_mb = size_bytes / (1024 * 1024)
                     wconn = conn_pool.get()
@@ -1519,50 +1522,63 @@ Exit codes:
                                 print(f"           [{tbl}] Completed in {duration:.1f}s")
                             return duration, None, None
                         except Exception as e:
+                            if interrupted.is_set():
+                                return None, None, None
                             with print_lock:
                                 print(f"           [{tbl}] FAILED: {e}")
                             return None, str(e), None
                         finally:
-                            release_vacuum_slot(wconn, slot)
+                            if not interrupted.is_set():
+                                try:
+                                    release_vacuum_slot(wconn, slot)
+                                except Exception:
+                                    pass  # Connection may be closed during shutdown
                     finally:
                         conn_pool.put(wconn)
 
+                # Don't use context manager — its __exit__ calls
+                # shutdown(wait=True) which blocks on first Ctrl+C,
+                # requiring a second Ctrl+C to break out.
+                executor = ThreadPoolExecutor(max_workers=workers)
+                futures: dict = {}
                 try:
-                    with ThreadPoolExecutor(max_workers=workers) as executor:
-                        futures = {
-                            executor.submit(_vacuum_one, tbl, age, sz, idx): (tbl, age, sz)
-                            for idx, tbl, age, sz in tables_to_run
-                        }
+                    futures = {
+                        executor.submit(_vacuum_one, tbl, age, sz, idx): (tbl, age, sz)
+                        for idx, tbl, age, sz in tables_to_run
+                    }
 
-                        for future in as_completed(futures):
-                            tbl, age, sz = futures[future]
-                            duration, error, skipped = future.result()
-                            if skipped:
-                                skipped_tables.append((tbl, skipped.pid, skipped.source))
-                            elif error:
-                                failed_tables.append((tbl, error))
-                            else:
-                                total_duration += duration
-                                if collect_metrics:
-                                    metrics.append(VacuumMetric(
-                                        timestamp=datetime.now().isoformat(),
-                                        table=tbl,
-                                        age_before=age,
-                                        size_bytes=sz,
-                                        duration_seconds=round(duration, 2),
-                                        database=args.database,
-                                        host=endpoint,
-                                    ))
+                    for future in as_completed(futures):
+                        tbl, age, sz = futures[future]
+                        duration, error, skipped = future.result()
+                        if skipped:
+                            skipped_tables.append((tbl, skipped.pid, skipped.source))
+                        elif error:
+                            failed_tables.append((tbl, error))
+                        elif duration is not None:
+                            total_duration += duration
+                            if collect_metrics:
+                                metrics.append(VacuumMetric(
+                                    timestamp=datetime.now().isoformat(),
+                                    table=tbl,
+                                    age_before=age,
+                                    size_bytes=sz,
+                                    duration_seconds=round(duration, 2),
+                                    database=args.database,
+                                    host=endpoint,
+                                ))
                 except KeyboardInterrupt:
                     print("\n\nInterrupted — canceling in-flight vacuums...")
+                    interrupted.set()
                     for f in futures:
                         f.cancel()
                     for wc in worker_conns:
-                        wc.close()
+                        if not wc.closed:
+                            wc.close()
+                    executor.shutdown(wait=False)
                     print("Worker connections closed. In-flight vacuums canceled.")
                     return 1
                 finally:
-                    # Close worker connections (normal exit path)
+                    executor.shutdown(wait=False)
                     for wc in worker_conns:
                         if not wc.closed:
                             wc.close()
