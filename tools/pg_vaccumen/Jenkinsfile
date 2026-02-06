@@ -99,7 +99,7 @@ pipeline {
         string(
             name: 'WORKERS',
             defaultValue: '1',
-            description: 'Parallel vacuum workers (default: 1). WARNING: >1 increases I/O load. Capped at 8, auto-reduced if unsafe.'
+            description: 'Parallel vacuum workers — global limit across all instances via advisory locks (default: 1). WARNING: >1 increases I/O load. Capped at 8, auto-reduced if unsafe.'
         )
         booleanParam(
             name: 'EXECUTE',
