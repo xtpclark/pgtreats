@@ -1074,6 +1074,38 @@ limit 20;
 | `Jenkinsfile` | Jenkins pipeline |
 | `requirements.txt` | Python dependencies |
 
+## See Also
+
+**Similar tools:**
+
+| Tool | Description |
+|------|-------------|
+| [flexible-freeze](https://github.com/pgexperts/flexible-freeze) | By Josh Berkus (pgExperts). VACUUM FREEZE during off-hours with timeout. |
+| [pg_vacuum](https://github.com/MichaelDBA/pg_vacuum) | Python vacuum/analyze/freeze tool with parallel support. |
+| [manual_vacuum.sh](https://github.com/omniti-labs/pgtreats/blob/master/tools/manual_vacuum.sh) | Shell script that inspired pg_vaccumen (OmniTI pgtreats). |
+
+**What pg_vaccumen adds:**
+
+- **Global concurrency control** - Advisory locks coordinate across multiple instances; safe to run from multiple Jenkins agents
+- **Live vacuum detection** - Skips tables already being vacuumed (by autovacuum or other sessions)
+- **Transaction rate tracking** - "Days until autovacuum" estimate from stored baseline
+- **Blocker detection** - Fails fast if replication slots, long transactions, or prepared transactions would prevent progress
+- **Metrics storage** - Vacuum duration/size history in PostgreSQL for trend analysis
+- **Jenkins-ready** - Exit codes (0/1/2/3) map to SUCCESS/FAILURE/UNSTABLE
+
+**Monitoring and diagnostics:**
+
+| Tool | Description |
+|------|-------------|
+| [pg-autovacuum-diagnostics](https://github.com/heap/pg-autovacuum-diagnostics) | Queries to diagnose vacuum/autovacuum problems. |
+| [postgres_get_av_diag()](https://aws.amazon.com/blogs/database/prevent-transaction-id-wraparound-by-using-postgres_get_av_diag-for-monitoring-autovacuum/) | AWS RDS/Aurora function (PG 16.7+) for autovacuum blocker detection. |
+
+**Further reading:**
+
+- [Managing Transaction ID Wraparound](https://www.crunchydata.com/blog/managing-transaction-id-wraparound-in-postgresql) - Crunchy Data
+- [Autovacuum Wraparound Protection](https://www.cybertec-postgresql.com/en/autovacuum-wraparound-protection-in-postgresql/) - Cybertec
+- [PostgreSQL Routine Vacuuming](https://www.postgresql.org/docs/current/routine-vacuuming.html) - Official docs
+
 ## Attribution
 
 Inspired by [manual_vacuum.sh](https://github.com/omniti-labs/pgtreats/blob/master/tools/manual_vacuum.sh) from OmniTI's pgtreats.
