@@ -1066,6 +1066,58 @@ limit 20;
 - **`vacuum_freeze_min_age`**: 50M (floor for row freezing)
 - Aurora has safeguards and won't kill the database on wraparound like open-source PostgreSQL
 
+## Database User Setup (Least Privilege)
+
+Create a dedicated service account with only the permissions pg_vaccumen needs:
+
+```sql
+-- Create the service account
+CREATE USER vaccumen_svc WITH PASSWORD 'use-a-strong-password';
+
+-- Read pg_stat_activity, pg_replication_slots, pg_prepared_xacts
+-- (required for blocker detection and live vacuum checks)
+GRANT pg_monitor TO vaccumen_svc;
+
+-- Run VACUUM on any table without requiring ownership (PostgreSQL 16+)
+GRANT pg_maintain TO vaccumen_svc;
+
+-- Create and use vacuum_metrics + vacuum_baseline tables
+GRANT USAGE, CREATE ON SCHEMA public TO vaccumen_svc;
+
+-- Optional: after the first run creates the tracking tables, tighten permissions:
+-- REVOKE CREATE ON SCHEMA public FROM vaccumen_svc;
+```
+
+### What each privilege provides
+
+| Privilege | Required for |
+|-----------|-------------|
+| `pg_monitor` | `pg_stat_activity` (blocker detection, live vacuum checks), `pg_replication_slots`, `pg_prepared_xacts` |
+| `pg_maintain` | `VACUUM (VERBOSE, ANALYZE)` on any table without ownership |
+| `CREATE ON SCHEMA public` | One-time creation of `vacuum_metrics` and `vacuum_baseline` tables |
+| `USAGE ON SCHEMA public` | Reading/writing the tracking tables |
+
+### What it does NOT need
+
+- No superuser or `rds_superuser`
+- No table ownership
+- No `pg_write_all_data` or `pg_read_all_data`
+- Advisory locks (`pg_try_advisory_lock`) work for any user
+- System catalog reads (`pg_class`, `pg_stat_user_tables`) work for any user
+- `SHOW` commands (`autovacuum_freeze_max_age`, `maintenance_work_mem`) work for any user
+
+### PostgreSQL versions before 16
+
+`pg_maintain` was introduced in PostgreSQL 16. On older versions, grant `MAINTAIN` per-table or use a role that owns the tables:
+
+```sql
+-- PostgreSQL 15: grant MAINTAIN on specific tables
+GRANT MAINTAIN ON ALL TABLES IN SCHEMA public TO vaccumen_svc;
+
+-- PostgreSQL 14 and earlier: no MAINTAIN privilege exists.
+-- The user must own the tables, or use a superuser account.
+```
+
 ## Files
 
 | File | Description |
